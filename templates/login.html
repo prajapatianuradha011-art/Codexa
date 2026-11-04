@@ -4,47 +4,120 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login</title>
+    <meta name="theme-color" content="#0b141a">
+    <title>Login | Codexa Technologies</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
 </head>
 
 <body>
+    <main class="auth-page">
+        <section class="auth-box" aria-labelledby="page-title">
+            <a class="brand" href="/" aria-label="Codexa Technologies home">
+                <span class="brand-mark">C</span>
+                <span class="brand-name">CODEXA <span>TECHNOLOGIES</span></span>
+            </a>
 
-    <div class="auth-box">
-        <h2>Login 🔐</h2>
-
-        <!-- Error Message -->
-        {% if error %}
-        <p style="color:red;">{{ error }}</p>
-        {% endif %}
-
-        <form method="POST">
-            <input name="username" placeholder="Username" required>
-
-            <div class="password-box">
-                <input id="password" name="password" type="password" placeholder="Password" required>
-                <span class="toggle-eye" onclick="togglePassword()">👁</span>
+            <div class="auth-heading">
+                <div class="auth-icon" aria-hidden="true">↗</div>
+                <p class="eyebrow">WELCOME BACK</p>
+                <h1 id="page-title">Login to Codexa</h1>
+                <p class="subtitle">Continue your conversations and stay connected.</p>
             </div>
 
-            <button type="submit">Login</button>
-        </form>
+            {% if error %}
+            <div class="server-message error-message" role="alert">{{ error }}</div>
+            {% endif %}
 
-        <br>
-        <a href="/signup">Create new account</a>
-    </div>
+            <form id="loginForm" method="POST" action="{{ url_for('login') }}" novalidate>
+                <div class="field">
+                    <label for="username">Username</label>
+                    <input id="username" name="username" type="text" placeholder="Enter your username"
+                        autocomplete="username" minlength="1" maxlength="30" required>
+                    <small class="field-error" id="usernameError"></small>
+                </div>
+
+                <div class="field">
+                    <label for="password">Password</label>
+                    <div class="password-box">
+                        <input id="password" name="password" type="password" placeholder="Enter your password"
+                            autocomplete="current-password" required>
+                        <button class="toggle-eye" type="button" aria-label="Show password" aria-pressed="false"
+                            data-password-toggle="password">
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z" />
+                                <circle cx="12" cy="12" r="3" />
+                            </svg>
+                        </button>
+                    </div>
+                    <small class="field-error" id="passwordError"></small>
+                </div>
+
+                <div class="form-message" id="formMessage" role="alert" aria-live="polite"></div>
+                <button class="submit-button" id="submitButton" type="submit">
+                    <span>Login</span><span aria-hidden="true">→</span>
+                </button>
+            </form>
+
+            <p class="auth-switch">New to Codexa? <a href="{{ url_for('signup') }}">Create an account</a></p>
+            <p class="security-note"><span aria-hidden="true">●</span> Your account is protected</p>
+        </section>
+        <footer class="page-footer">© {{ 2026 }} Codexa Technologies. All rights reserved.</footer>
+    </main>
 
     <script>
-        function togglePassword() {
-            var pass = document.getElementById("password");
+        (() => {
+            const form = document.getElementById("loginForm");
+            const username = document.getElementById("username");
+            const password = document.getElementById("password");
+            const message = document.getElementById("formMessage");
+            const submit = document.getElementById("submitButton");
 
-            if (pass.type === "password") {
-                pass.type = "text";
-            } else {
-                pass.type = "password";
+            document.querySelectorAll("[data-password-toggle]").forEach(button => {
+                button.addEventListener("click", () => {
+                    const field = document.getElementById(button.dataset.passwordToggle);
+                    const show = field.type === "password";
+                    field.type = show ? "text" : "password";
+                    button.setAttribute("aria-pressed", String(show));
+                    button.setAttribute("aria-label", show ? "Hide password" : "Show password");
+                    field.focus();
+                });
+            });
+
+            function setError(id, text) {
+                document.getElementById(id + "Error").textContent = text;
+                document.getElementById(id).setAttribute("aria-invalid", text ? "true" : "false");
             }
-        }
-    </script>
 
+            form.addEventListener("submit", event => {
+                let valid = true;
+                message.textContent = "";
+                setError("username", "");
+                setError("password", "");
+
+                if (!username.value.trim()) {
+                    setError("username", "Please enter your username.");
+                    valid = false;
+                } else if (username.value.trim().length > 30) {
+                    setError("username", "Username cannot exceed 30 characters.");
+                    valid = false;
+                }
+
+                if (!password.value) {
+                    setError("password", "Please enter your password.");
+                    valid = false;
+                }
+
+                if (!valid) {
+                    event.preventDefault();
+                    message.textContent = "Please correct the highlighted fields.";
+                    return;
+                }
+
+                submit.disabled = true;
+                submit.querySelector("span").textContent = "Logging in…";
+            });
+        })();
+    </script>
 </body>
 
 </html>
