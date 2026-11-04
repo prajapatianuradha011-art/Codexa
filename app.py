@@ -62,16 +62,9 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 type TEXT NOT NULL DEFAULT 'private',
                 private_key TEXT UNIQUE,
-                name TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        conversation_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(conversations)")
-        }
-        if "name" not in conversation_columns:
-            conn.execute("ALTER TABLE conversations ADD COLUMN name TEXT")
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_members (
                 conversation_id INTEGER NOT NULL,
@@ -164,7 +157,6 @@ def conversation_payload(conn, conversation_id, current_user_id):
     return {
         "id": conversation["id"],
         "type": conversation["type"],
-        "name": conversation["name"],
         "members": [{"id": m["id"], "username": m["username"]} for m in members],
         "last_message": dict(last) if last else None,
     }
@@ -297,75 +289,6 @@ def create_private_conversation():
     return jsonify({"conversation": result})
 
 
-@app.route("/api/conversations/group", methods=["POST"])
-def create_group_conversation():
-    user = get_logged_in_user()
-    if not user:
-        return jsonify({"error": "Login required"}), 401
-
-    data = request.get_json(silent=True) or {}
-    name = data.get("name")
-    usernames = data.get("members", [])
-
-    if not isinstance(name, str) or not name.strip():
-        return jsonify({"error": "Enter a group name."}), 400
-    name = name.strip()
-    if len(name) > 60:
-        return jsonify({"error": "Group name must be 60 characters or fewer."}), 400
-    if not isinstance(usernames, list):
-        return jsonify({"error": "Members must be a list."}), 400
-
-    requested = []
-    seen = {user["username"].casefold()}
-    for item in usernames:
-        if isinstance(item, str) and item.strip():
-            candidate = item.strip()
-            if candidate.casefold() not in seen:
-                seen.add(candidate.casefold())
-                requested.append(candidate)
-
-    if not requested:
-        return jsonify({"error": "Add at least one other member."}), 400
-
-    with get_db() as conn:
-        members = []
-        for username in requested:
-            member = conn.execute(
-                "SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
-                (username,)
-            ).fetchone()
-            if not member:
-                return jsonify({"error": f"User '{username}' does not exist."}), 404
-            members.append(member)
-
-        cursor = conn.execute(
-            "INSERT INTO conversations (type, private_key, name) VALUES ('group', NULL, ?)",
-            (name,)
-        )
-        cid = cursor.lastrowid
-        ids = [user["id"]] + [member["id"] for member in members]
-        conn.executemany(
-            "INSERT INTO conversation_members (conversation_id, user_id) VALUES (?, ?)",
-            [(cid, member_id) for member_id in ids]
-        )
-        conversation = conversation_payload(conn, cid, user["id"])
-
-    return jsonify({"conversation": conversation})
-
-
-@app.route("/api/users")
-def api_users():
-    user = get_logged_in_user()
-    if not user:
-        return jsonify({"error": "Login required"}), 401
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT username FROM users WHERE id != ? ORDER BY username COLLATE NOCASE",
-            (user["id"],)
-        ).fetchall()
-    return jsonify({"users": [row["username"] for row in rows]})
-
-
 @app.route("/api/conversations/<int:conversation_id>/messages")
 def api_messages(conversation_id):
     user = get_logged_in_user()
@@ -491,22 +414,17 @@ def handle_chat_message(data):
                 JOIN users u ON u.id = cm.user_id
                 WHERE cm.conversation_id = ?
             """, (cid,)).fetchall()
+            recipient = next((m for m in members if m["id"] != uid), None)
             sender = next((m for m in members if m["id"] == uid), None)
-            other_members = [m for m in members if m["id"] != uid]
-            if not sender or not other_members:
-                emit("chat_error", {"msg": "Invalid conversation or no other members."})
+            if not recipient or not sender:
+                emit("chat_error", {"msg": "Invalid private conversation."})
                 return
-
-            conversation_type = conn.execute(
-                "SELECT type FROM conversations WHERE id = ?", (cid,)
-            ).fetchone()["type"]
-            receiver_id = other_members[0]["id"] if conversation_type == "private" else None
 
             cursor = conn.execute("""
                 INSERT INTO messages
                     (username, msg, sender_id, receiver_id, conversation_id, is_read)
                 VALUES (?, ?, ?, ?, ?, 0)
-            """, (sender["username"], msg, uid, receiver_id, cid))
+            """, (sender["username"], msg, uid, recipient["id"], cid))
             message_id = cursor.lastrowid
             saved = conn.execute(
                 "SELECT created_at FROM messages WHERE id = ?", (message_id,)
@@ -520,11 +438,9 @@ def handle_chat_message(data):
             "created_at": saved["created_at"],
         }
 
-        # Deliver to every other member's private room. Offline members will
-        # see the saved message when they next load this conversation.
-        for member in other_members:
-            socketio.emit("new_message", payload, room=f"user:{member['id']}")
-        # Acknowledge to the sender without broadcasting a duplicate to them.
+        # Recipient gets the message on every active tab, without opening the chat first.
+        socketio.emit("new_message", payload, room=f"user:{recipient['id']}")
+        # Sender gets a confirmation on the sending socket only.
         emit("message_sent", payload)
 
     except sqlite3.Error as error:
