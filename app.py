@@ -1,62 +1,31 @@
 import os
 import sqlite3
-import time
-from collections import defaultdict
-from contextlib import contextmanager
 
 from flask import (
-    Flask, jsonify, redirect, render_template, request,
-    session, url_for
+    Flask, render_template, request, redirect, session,
+    url_for, jsonify
 )
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_socketio import SocketIO, emit, join_room
 from werkzeug.security import generate_password_hash, check_password_hash
 
 
-# ---------------------------------------------------------------------------
-# Application configuration
-# ---------------------------------------------------------------------------
-
 app = Flask(__name__)
-app.config.update(
-    SECRET_KEY=os.environ.get("SECRET_KEY", "dev-only-change-this-secret"),
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
+app.config["SECRET_KEY"] = os.environ.get(
+    "SECRET_KEY", "dev-only-change-this-secret"
 )
+
+# threading mode is broadly compatible with the standard Flask-SocketIO install.
+socketio = SocketIO(app, cors_allowed_origins=None)
 
 DATABASE = os.path.join(app.root_path, "chat.db")
 MAX_MESSAGE_LENGTH = 2000
-MAX_USERNAME_LENGTH = 30
-MAX_GROUP_NAME_LENGTH = 60
-MAX_GROUP_MEMBERS = 50
-MESSAGE_HISTORY_LIMIT = 100
-SOCKET_MESSAGE_COOLDOWN = 0.35
-
-socketio = SocketIO(
-    app,
-    async_mode=os.environ.get("SOCKETIO_ASYNC_MODE") or None,
-    cors_allowed_origins=os.environ.get("CORS_ALLOWED_ORIGINS") or None,
-)
 
 
-# ---------------------------------------------------------------------------
-# Database layer
-# ---------------------------------------------------------------------------
-
-@contextmanager
 def get_db():
-    """Open a short-lived SQLite connection and always close it."""
     conn = sqlite3.connect(DATABASE, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return conn
 
 
 def init_db():
@@ -65,12 +34,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                password TEXT NOT NULL
             )
         """)
 
-        # Keep the old messages table so existing data is not destroyed.
+        # Keep the original columns so an existing chat.db is not destroyed.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,150 +48,57 @@ def init_db():
             )
         """)
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                type TEXT NOT NULL CHECK(type IN ('private', 'group')),
-                created_by INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(created_by) REFERENCES users(id)
-            )
-        """)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(messages)")
+        }
+
+        migrations = {
+            "sender_id": "INTEGER",
+            "receiver_id": "INTEGER",
+            "is_read": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, definition in migrations.items():
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE messages ADD COLUMN {column} {definition}"
+                )
 
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS conversation_members (
-                conversation_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(conversation_id, user_id),
-                FOREIGN KEY(conversation_id) REFERENCES conversations(id)
-                    ON DELETE CASCADE,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                body TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(conversation_id) REFERENCES conversations(id)
-                    ON DELETE CASCADE,
-                FOREIGN KEY(sender_id) REFERENCES users(id)
-            )
-        """)
-
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
-            ON chat_messages(conversation_id, id)
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation
+            ON messages(sender_id, receiver_id, id)
         """)
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_members_user
-            ON conversation_members(user_id, conversation_id)
+            CREATE INDEX IF NOT EXISTS idx_messages_receiver_unread
+            ON messages(receiver_id, is_read, id)
         """)
 
 
 init_db()
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
 def current_user():
-    username = session.get("user")
-    if not username:
+    """Return the logged-in user row, or None."""
+    user_id = session.get("user_id")
+    if not user_id:
         return None
+
     with get_db() as conn:
         return conn.execute(
-            "SELECT id, username FROM users WHERE username = ?",
-            (username,)
+            "SELECT id, username FROM users WHERE id = ?", (user_id,)
         ).fetchone()
 
-
-def conversation_for_user(conn, conversation_id, user_id):
-    return conn.execute("""
-        SELECT c.id, c.name, c.type, c.created_by
-        FROM conversations c
-        JOIN conversation_members cm
-          ON cm.conversation_id = c.id
-        WHERE c.id = ? AND cm.user_id = ?
-    """, (conversation_id, user_id)).fetchone()
-
-
-def is_conversation_member(conn, conversation_id, user_id):
-    return conn.execute("""
-        SELECT 1 FROM conversation_members
-        WHERE conversation_id = ? AND user_id = ?
-    """, (conversation_id, user_id)).fetchone() is not None
-
-
-def conversation_payload(conn, conversation_id, viewer_id):
-    conversation = conversation_for_user(conn, conversation_id, viewer_id)
-    if not conversation:
-        return None
-
-    members = conn.execute("""
-        SELECT u.id, u.username
-        FROM users u
-        JOIN conversation_members cm ON cm.user_id = u.id
-        WHERE cm.conversation_id = ?
-        ORDER BY u.username COLLATE NOCASE
-    """, (conversation_id,)).fetchall()
-
-    last_message = conn.execute("""
-        SELECT m.id, m.body, m.created_at, u.username AS sender
-        FROM chat_messages m
-        JOIN users u ON u.id = m.sender_id
-        WHERE m.conversation_id = ?
-        ORDER BY m.id DESC LIMIT 1
-    """, (conversation_id,)).fetchone()
-
-    return {
-        "id": conversation["id"],
-        "name": conversation["name"],
-        "type": conversation["type"],
-        "members": [dict(member) for member in members],
-        "last_message": dict(last_message) if last_message else None,
-    }
-
-
-def error_response(message, status=400):
-    return jsonify({"ok": False, "error": message}), status
-
-
-# ---------------------------------------------------------------------------
-# Authentication and page routes
-# ---------------------------------------------------------------------------
 
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        confirm_password = request.form.get("confirm_password", "")
 
-        if not username or len(username) > MAX_USERNAME_LENGTH:
-            return render_template(
-                "signup.html",
-                error="Username must be between 1 and 30 characters."
-            ), 400
-
+        if not username or len(username) > 30:
+            return "Username must be 1-30 characters.", 400
         if len(password) < 8:
-            return render_template(
-                "signup.html",
-                error="Password must be at least 8 characters."
-            ), 400
-
-        if confirm_password and password != confirm_password:
-            return render_template(
-                "signup.html",
-                error="Passwords do not match."
-            ), 400
+            return "Password must be at least 8 characters.", 400
 
         try:
             with get_db() as conn:
@@ -232,10 +107,7 @@ def signup():
                     (username, generate_password_hash(password))
                 )
         except sqlite3.IntegrityError:
-            return render_template(
-                "signup.html",
-                error="That username is already taken. Please choose another."
-            ), 409
+            return "Username already exists.", 409
 
         return redirect(url_for("login"))
 
@@ -250,21 +122,16 @@ def login():
 
         with get_db() as conn:
             user = conn.execute(
-                "SELECT id, username, password FROM users WHERE username = ?",
-                (username,)
+                "SELECT * FROM users WHERE username = ?", (username,)
             ).fetchone()
 
             valid = False
             if user:
                 stored_password = user["password"]
-                try:
-                    valid = check_password_hash(stored_password, password)
-                except (ValueError, TypeError):
-                    valid = False
-
-                # One-time migration for accounts created by the old version,
-                # which stored passwords as plain text. Remove after migration.
-                if not valid and stored_password == password:
+                if check_password_hash(stored_password, password):
+                    valid = True
+                # Upgrade legacy plain-text passwords, if any.
+                elif stored_password == password:
                     valid = True
                     conn.execute(
                         "UPDATE users SET password = ? WHERE id = ?",
@@ -273,13 +140,11 @@ def login():
 
         if valid:
             session.clear()
-            session["user"] = username
+            session["user_id"] = user["id"]
+            session["user"] = user["username"]
             return redirect(url_for("home"))
 
-        return render_template(
-            "login.html",
-            error="Incorrect username or password. Please try again."
-        ), 401
+        return "Invalid username or password.", 401
 
     return render_template("login.html")
 
@@ -296,229 +161,59 @@ def home():
     if not user:
         return redirect(url_for("login"))
 
-    # Preserve compatibility with the existing chat.html template.
-    # New conversation-aware frontends should use /api/conversations.
+    # Show only this user's conversations, not everybody's messages.
     with get_db() as conn:
-        old_messages = conn.execute("""
-            SELECT username, msg, created_at
-            FROM messages
-            ORDER BY id DESC LIMIT 100
-        """).fetchall()
+        messages = conn.execute("""
+            SELECT
+                m.id,
+                m.msg,
+                m.created_at,
+                m.sender_id,
+                m.receiver_id,
+                sender.username AS username,
+                receiver.username AS receiver_username,
+                CASE WHEN m.sender_id = ? THEN 1 ELSE 0 END AS is_mine
+            FROM messages AS m
+            JOIN users AS sender ON sender.id = m.sender_id
+            JOIN users AS receiver ON receiver.id = m.receiver_id
+            WHERE m.sender_id = ? OR m.receiver_id = ?
+            ORDER BY m.id ASC
+            LIMIT 500
+        """, (user["id"], user["id"], user["id"])).fetchall()
+
+        # Mark messages delivered to this user as read when their chat page loads.
+        conn.execute("""
+            UPDATE messages
+            SET is_read = 1
+            WHERE receiver_id = ? AND is_read = 0
+        """, (user["id"],))
 
     return render_template(
         "chat.html",
         username=user["username"],
-        messages=list(reversed(old_messages)),
+        messages=messages
     )
 
 
-# ---------------------------------------------------------------------------
-# REST API: users and conversations
-# ---------------------------------------------------------------------------
-
-@app.get("/api/me")
-def api_me():
+@app.route("/api/users")
+def list_users():
+    """Frontend can use this endpoint to populate its recipient/contact list."""
     user = current_user()
     if not user:
-        return error_response("Authentication required.", 401)
-    return jsonify({"ok": True, "user": dict(user)})
+        return jsonify({"error": "Login required"}), 401
 
-
-@app.get("/api/users")
-def api_users():
-    user = current_user()
-    if not user:
-        return error_response("Authentication required.", 401)
-
-    search = request.args.get("q", "").strip()
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT id, username FROM users
-            WHERE id != ? AND username LIKE ?
+        users = conn.execute("""
+            SELECT id, username
+            FROM users
+            WHERE id != ?
             ORDER BY username COLLATE NOCASE
-            LIMIT 50
-        """, (user["id"], f"%{search}%")).fetchall()
-
-    return jsonify({"ok": True, "users": [dict(row) for row in rows]})
-
-
-@app.get("/api/conversations")
-def api_conversations():
-    user = current_user()
-    if not user:
-        return error_response("Authentication required.", 401)
-
-    with get_db() as conn:
-        ids = conn.execute("""
-            SELECT conversation_id FROM conversation_members
-            WHERE user_id = ?
         """, (user["id"],)).fetchall()
-        conversations = [
-            conversation_payload(conn, row["conversation_id"], user["id"])
-            for row in ids
-        ]
 
-    conversations.sort(
-        key=lambda item: (
-            item["last_message"]["created_at"] if item["last_message"] else ""
-        ),
-        reverse=True
-    )
-    return jsonify({"ok": True, "conversations": conversations})
-
-
-@app.post("/api/conversations/private")
-def create_private_conversation():
-    user = current_user()
-    if not user:
-        return error_response("Authentication required.", 401)
-
-    data = request.get_json(silent=True) or {}
-    target_username = str(data.get("username", "")).strip()
-
-    if not target_username or target_username == user["username"]:
-        return error_response("Provide another user's username.")
-
-    with get_db() as conn:
-        target = conn.execute(
-            "SELECT id FROM users WHERE username = ?",
-            (target_username,)
-        ).fetchone()
-        if not target:
-            return error_response("User not found.", 404)
-
-        # Reuse an existing private conversation between these two users.
-        existing = conn.execute("""
-            SELECT c.id
-            FROM conversations c
-            JOIN conversation_members a ON a.conversation_id = c.id
-            JOIN conversation_members b ON b.conversation_id = c.id
-            WHERE c.type = 'private'
-              AND a.user_id = ? AND b.user_id = ?
-              AND (
-                SELECT COUNT(*) FROM conversation_members x
-                WHERE x.conversation_id = c.id
-              ) = 2
-            LIMIT 1
-        """, (user["id"], target["id"])).fetchone()
-
-        if existing:
-            conversation_id = existing["id"]
-        else:
-            cursor = conn.execute("""
-                INSERT INTO conversations (type, created_by)
-                VALUES ('private', ?)
-            """, (user["id"],))
-            conversation_id = cursor.lastrowid
-            conn.executemany("""
-                INSERT INTO conversation_members (conversation_id, user_id)
-                VALUES (?, ?)
-            """, [
-                (conversation_id, user["id"]),
-                (conversation_id, target["id"]),
-            ])
-
-        payload = conversation_payload(conn, conversation_id, user["id"])
-
-    return jsonify({"ok": True, "conversation": payload}), 201
-
-
-@app.post("/api/conversations/group")
-def create_group_conversation():
-    user = current_user()
-    if not user:
-        return error_response("Authentication required.", 401)
-
-    data = request.get_json(silent=True) or {}
-    name = str(data.get("name", "")).strip()
-    usernames = data.get("members", [])
-
-    if not name or len(name) > MAX_GROUP_NAME_LENGTH:
-        return error_response("Group name must be 1-60 characters.")
-    if not isinstance(usernames, list):
-        return error_response("'members' must be a list of usernames.")
-
-    usernames = list(dict.fromkeys(
-        str(item).strip() for item in usernames if str(item).strip()
-    ))
-    if user["username"] not in usernames:
-        usernames.append(user["username"])
-    if len(usernames) > MAX_GROUP_MEMBERS:
-        return error_response(f"A group can have at most {MAX_GROUP_MEMBERS} members.")
-
-    with get_db() as conn:
-        placeholders = ",".join("?" for _ in usernames)
-        rows = conn.execute(
-            f"SELECT id, username FROM users WHERE username IN ({placeholders})",
-            usernames
-        ).fetchall()
-
-        found = {row["username"]: row["id"] for row in rows}
-        missing = [name for name in usernames if name not in found]
-        if missing:
-            return error_response(
-                "Unknown username(s): " + ", ".join(missing), 404
-            )
-
-        cursor = conn.execute("""
-            INSERT INTO conversations (name, type, created_by)
-            VALUES (?, 'group', ?)
-        """, (name, user["id"]))
-        conversation_id = cursor.lastrowid
-
-        conn.executemany("""
-            INSERT INTO conversation_members (conversation_id, user_id)
-            VALUES (?, ?)
-        """, [
-            (conversation_id, member_id)
-            for member_id in found.values()
-        ])
-
-        payload = conversation_payload(conn, conversation_id, user["id"])
-
-    return jsonify({"ok": True, "conversation": payload}), 201
-
-
-@app.get("/api/conversations/<int:conversation_id>/messages")
-def api_conversation_messages(conversation_id):
-    user = current_user()
-    if not user:
-        return error_response("Authentication required.", 401)
-
-    with get_db() as conn:
-        if not is_conversation_member(conn, conversation_id, user["id"]):
-            return error_response("Conversation not found.", 404)
-
-        rows = conn.execute("""
-            SELECT m.id, m.conversation_id, m.body, m.created_at,
-                   u.id AS sender_id, u.username AS sender
-            FROM chat_messages m
-            JOIN users u ON u.id = m.sender_id
-            WHERE m.conversation_id = ?
-            ORDER BY m.id DESC LIMIT ?
-        """, (conversation_id, MESSAGE_HISTORY_LIMIT)).fetchall()
-
-    messages = [dict(row) for row in reversed(rows)]
-    return jsonify({"ok": True, "messages": messages})
-
-
-# ---------------------------------------------------------------------------
-# Socket.IO presence tracking
-# ---------------------------------------------------------------------------
-
-# These dictionaries are process-local. For multiple workers/servers, use
-# Socket.IO's Redis message queue and shared presence storage.
-user_sids = defaultdict(set)       # username -> set of connected socket IDs
-sid_users = {}                     # socket ID -> username
-last_message_at = {}               # socket ID -> timestamp
-
-
-def online_usernames():
-    return sorted(user_sids.keys(), key=str.lower)
-
-
-def emit_presence():
-    socketio.emit("presence_update", {"online_users": online_usernames()})
+    return jsonify([
+        {"id": row["id"], "username": row["username"]}
+        for row in users
+    ])
 
 
 @socketio.on("connect")
@@ -527,173 +222,109 @@ def handle_connect(auth=None):
     if not user:
         return False
 
-    username = user["username"]
-    sid_users[request.sid] = username
-    user_sids[username].add(request.sid)
-
-    emit("connected", {"username": username})
-    emit_presence()
-
-
-@socketio.on("disconnect")
-def handle_disconnect(reason=None):
-    username = sid_users.pop(request.sid, None)
-    last_message_at.pop(request.sid, None)
-
-    if username:
-        user_sids[username].discard(request.sid)
-        if not user_sids[username]:
-            user_sids.pop(username, None)
-        emit_presence()
-
-
-@socketio.on("join_conversation")
-def handle_join_conversation(data):
-    username = sid_users.get(request.sid)
-    if not username or not isinstance(data, dict):
-        return
-
-    conversation_id = data.get("conversation_id")
-    try:
-        conversation_id = int(conversation_id)
-    except (TypeError, ValueError):
-        emit("chat_error", {"msg": "Invalid conversation ID."})
-        return
-
-    user = current_user()
-    if not user:
-        return
-
-    with get_db() as conn:
-        allowed = is_conversation_member(conn, conversation_id, user["id"])
-
-    if not allowed:
-        emit("chat_error", {"msg": "You are not a member of this conversation."})
-        return
-
-    join_room(f"conversation:{conversation_id}")
-    emit("joined_conversation", {"conversation_id": conversation_id})
-
-
-@socketio.on("leave_conversation")
-def handle_leave_conversation(data):
-    if not isinstance(data, dict):
-        return
-    try:
-        conversation_id = int(data.get("conversation_id"))
-    except (TypeError, ValueError):
-        return
-    leave_room(f"conversation:{conversation_id}")
-    emit("left_conversation", {"conversation_id": conversation_id})
+    # Every authenticated socket joins its own private room.
+    join_room(f"user:{user['id']}")
+    print(f"Chat connected: {user['username']} (user_id={user['id']})")
 
 
 @socketio.on("chat_message")
-def handle_chat_message(data):
-    username = sid_users.get(request.sid)
-    if not username or not isinstance(data, dict):
+def handle_message(data):
+    user = current_user()
+    if not user:
+        emit("chat_error", {"msg": "Please log in again."})
         return
 
-    body = data.get("msg", data.get("body"))
-    try:
-        conversation_id = int(data.get("conversation_id"))
-    except (TypeError, ValueError):
-        emit("chat_error", {"msg": "A valid conversation_id is required."})
+    if not isinstance(data, dict):
+        emit("chat_error", {"msg": "Invalid message format."})
         return
 
-    if not isinstance(body, str):
+    msg = data.get("msg")
+    # Accept common frontend key names for the recipient username.
+    recipient = (
+        data.get("to")
+        or data.get("receiver")
+        or data.get("recipient")
+        or data.get("receiver_username")
+    )
+
+    if not isinstance(msg, str):
         emit("chat_error", {"msg": "Message must be text."})
         return
 
-    body = body.strip()
-    if not body or len(body) > MAX_MESSAGE_LENGTH:
+    msg = msg.strip()
+    if not msg or len(msg) > MAX_MESSAGE_LENGTH:
         emit("chat_error", {
-            "msg": f"Message must be 1-{MAX_MESSAGE_LENGTH} characters."
+            "msg": f"Message must contain 1-{MAX_MESSAGE_LENGTH} characters."
         })
         return
 
-    now = time.monotonic()
-    previous = last_message_at.get(request.sid, 0)
-    if now - previous < SOCKET_MESSAGE_COOLDOWN:
-        emit("chat_error", {"msg": "You're sending messages too quickly."})
-        return
-    last_message_at[request.sid] = now
-
-    user = current_user()
-    if not user:
+    if not isinstance(recipient, str) or not recipient.strip():
+        emit("chat_error", {
+            "msg": "Choose a recipient. Send {msg: 'Hello', to: 'username'}."
+        })
         return
 
-    with get_db() as conn:
-        if not is_conversation_member(conn, conversation_id, user["id"]):
-            emit("chat_error", {"msg": "You cannot send to this conversation."})
-            return
-
-        cursor = conn.execute("""
-            INSERT INTO chat_messages (conversation_id, sender_id, body)
-            VALUES (?, ?, ?)
-        """, (conversation_id, user["id"], body))
-
-        row = conn.execute("""
-            SELECT m.id, m.conversation_id, m.body, m.created_at,
-                   u.id AS sender_id, u.username AS sender
-            FROM chat_messages m
-            JOIN users u ON u.id = m.sender_id
-            WHERE m.id = ?
-        """, (cursor.lastrowid,)).fetchone()
-
-    # Only sockets that joined this conversation room receive the message.
-    socketio.emit(
-        "new_message",
-        dict(row),
-        room=f"conversation:{conversation_id}"
-    )
-
-
-@socketio.on("typing")
-def handle_typing(data):
-    username = sid_users.get(request.sid)
-    if not username or not isinstance(data, dict):
-        return
+    recipient = recipient.strip()
 
     try:
-        conversation_id = int(data.get("conversation_id"))
-    except (TypeError, ValueError):
-        return
+        with get_db() as conn:
+            target = conn.execute(
+                "SELECT id, username FROM users WHERE username = ?",
+                (recipient,)
+            ).fetchone()
 
-    user = current_user()
-    if not user:
-        return
+            if not target:
+                emit("chat_error", {"msg": "That user does not exist."})
+                return
 
-    with get_db() as conn:
-        if not is_conversation_member(conn, conversation_id, user["id"]):
-            return
+            if target["id"] == user["id"]:
+                emit("chat_error", {"msg": "You cannot message yourself."})
+                return
 
-    socketio.emit(
-        "user_typing",
-        {
-            "conversation_id": conversation_id,
-            "username": username,
-            "is_typing": bool(data.get("is_typing", True)),
-        },
-        room=f"conversation:{conversation_id}",
-        include_self=False,
-    )
+            cursor = conn.execute("""
+                INSERT INTO messages
+                    (username, msg, sender_id, receiver_id, is_read)
+                VALUES (?, ?, ?, ?, 0)
+            """, (user["username"], msg, user["id"], target["id"]))
+            message_id = cursor.lastrowid
 
+            saved = conn.execute("""
+                SELECT created_at FROM messages WHERE id = ?
+            """, (message_id,)).fetchone()
 
-@socketio.on("get_presence")
-def handle_get_presence():
-    if request.sid not in sid_users:
-        return
-    emit("presence_update", {"online_users": online_usernames()})
+        payload = {
+            "id": message_id,
+            "username": user["username"],
+            "sender": user["username"],
+            "receiver": target["username"],
+            "msg": msg,
+            "created_at": saved["created_at"],
+            "is_mine": False
+        }
 
+        # Emit only to the recipient's private room. If offline, no socket
+        # receives it, but the database row remains for their next login.
+        socketio.emit("new_message", payload, room=f"user:{target['id']}")
 
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
+        # Confirm to the sender so their UI can show the sent message.
+        emit("message_sent", {
+            **payload,
+            "is_mine": True
+        })
+
+        print(f"Message {message_id}: {user['username']} -> {target['username']}")
+
+    except sqlite3.Error as error:
+        print("Database error:", error)
+        emit("chat_error", {
+            "msg": "Message could not be saved. Please try again."
+        })
+
 
 if __name__ == "__main__":
     socketio.run(
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-        debug=os.environ.get("FLASK_DEBUG", "0") == "1",
+        debug=False
     )
