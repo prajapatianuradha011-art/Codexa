@@ -205,11 +205,25 @@ def signup():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
 
         if not username or len(username) > MAX_USERNAME_LENGTH:
-            return "Username must be 1-30 characters.", 400
+            return render_template(
+                "signup.html",
+                error="Username must be between 1 and 30 characters."
+            ), 400
+
         if len(password) < 8:
-            return "Password must be at least 8 characters.", 400
+            return render_template(
+                "signup.html",
+                error="Password must be at least 8 characters."
+            ), 400
+
+        if confirm_password and password != confirm_password:
+            return render_template(
+                "signup.html",
+                error="Passwords do not match."
+            ), 400
 
         try:
             with get_db() as conn:
@@ -218,7 +232,10 @@ def signup():
                     (username, generate_password_hash(password))
                 )
         except sqlite3.IntegrityError:
-            return "Username already exists.", 409
+            return render_template(
+                "signup.html",
+                error="That username is already taken. Please choose another."
+            ), 409
 
         return redirect(url_for("login"))
 
@@ -259,7 +276,10 @@ def login():
             session["user"] = username
             return redirect(url_for("home"))
 
-        return "Invalid username or password.", 401
+        return render_template(
+            "login.html",
+            error="Incorrect username or password. Please try again."
+        ), 401
 
     return render_template("login.html")
 
