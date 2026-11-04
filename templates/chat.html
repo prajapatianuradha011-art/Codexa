@@ -4,29 +4,27 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Chat App</title>
-
+    <title>Codexa Chat</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
 
 <body>
     <div class="app">
-
-        <!-- LEFT SIDEBAR -->
         <aside class="sidebar">
             <div class="sidebar-header">
                 <div class="profile">
-                    <div class="avatar">
-                        {{ username[0]|upper }}
-                    </div>
+                    <div class="avatar">{{ username[0]|upper }}</div>
                     <div class="profile-name">{{ username }}</div>
                 </div>
-
                 <form action="/logout" method="POST">
                     <button class="icon-button" type="submit" title="Logout">↪</button>
                 </form>
+            </div>
+
+            <div class="sidebar-actions">
+                <button class="new-chat-button" id="newPrivateButton" type="button">＋ New chat</button>
+                <button class="new-chat-button secondary" id="newGroupButton" type="button">＋ New group</button>
             </div>
 
             <div class="search-area">
@@ -36,219 +34,421 @@
                 </div>
             </div>
 
-            <div class="chat-list">
-                <button class="chat-item active" id="globalChatItem" type="button">
-                    <div class="avatar">💬</div>
-                    <div class="chat-details">
-                        <div class="chat-title-row">
-                            <span class="chat-title">Global Chat</span>
-                            <span class="chat-time" id="lastTime"></span>
-                        </div>
-                        <div class="chat-preview" id="lastPreview">
-                            Welcome! Start a conversation.
-                        </div>
-                    </div>
-                </button>
+            <div class="chat-list" id="chatList">
+                <div class="empty-note">Loading conversations…</div>
+            </div>
+
+            <div class="online-panel">
+                <h3>Online now</h3>
+                <ul id="onlineUsers">
+                    <li>Connecting…</li>
+                </ul>
             </div>
         </aside>
 
-        <!-- MAIN CHAT -->
         <main class="conversation">
-
             <header class="conversation-header">
                 <div class="header-info">
-                    <div class="avatar">💬</div>
+                    <div class="avatar" id="conversationAvatar">💬</div>
                     <div>
-                        <div class="header-title">Global Chat</div>
-                        <div class="header-status" id="status">
-                            Connecting...
-                        </div>
+                        <div class="header-title" id="conversationTitle">Select a conversation</div>
+                        <div class="header-status" id="status">Connecting…</div>
                     </div>
                 </div>
-
-                <button class="icon-button" type="button" title="Search messages"
-                    onclick="document.getElementById('messageInput').focus()">
-                    ⋮
-                </button>
             </header>
 
             <section class="messages" id="messages" aria-live="polite">
                 <div class="day-label">Your conversations</div>
-
-                {% for message in messages %}
-                <div class="message {% if message['username'] == username %}mine{% endif %}">
-                    {% if message["username"] != username %}
-                    <div class="message-author">
-                        {{ message["username"] }}
-                    </div>
-                    {% endif %}
-
-                    <div class="message-text">{{ message["msg"] }}</div>
-
-                    <div class="message-meta">
-                        <span>{{ message["created_at"] or "" }}</span>
-                    </div>
-                </div>
-                {% endfor %}
+                <div class="empty-note">Choose a chat or start a new conversation.</div>
             </section>
 
+            <div class="typing-indicator" id="typingIndicator" aria-live="polite"></div>
+
             <form class="composer" id="messageForm">
-                <input id="messageInput" type="text" placeholder="Type a message" maxlength="2000" autocomplete="off"
-                    required>
-
-                <button class="send-button" id="sendButton" type="submit" title="Send message">
-                    ➤
-                </button>
+                <input id="messageInput" type="text" placeholder="Select a conversation first" maxlength="2000"
+                    autocomplete="off" disabled required>
+                <button class="send-button" id="sendButton" type="submit" title="Send message" disabled>➤</button>
             </form>
-
         </main>
     </div>
 
     <script>
-
-        // 1. Connect to the Socket.IO server FIRST
+        (() => {
+            const currentUsername = {{ username | tojson
+        }};
         const socket = io();
 
-        // 2. Get the current logged-in username
-        const currentUsername = {{ username | tojson }};
+        const el = id => document.getElementById(id);
+        const chatList = el("chatList");
+        const messagesElement = el("messages");
+        const messageForm = el("messageForm");
+        const messageInput = el("messageInput");
+        const sendButton = el("sendButton");
+        const statusElement = el("status");
+        const searchInput = el("searchInput");
+        const onlineUsersElement = el("onlineUsers");
+        const typingIndicator = el("typingIndicator");
 
-        // 3. Find the online users list
-        const onlineUsersElement = document.getElementById("onlineUsers");
+        let conversations = [];
+        let activeConversation = null;
+        let typingTimer = null;
+        let currentlyTyping = new Set();
 
-        // 4. Listen for online user updates
-        socket.on("online_users", (users) => {
-            if (!onlineUsersElement) return;
+        async function api(url, options = {}) {
+            const response = await fetch(url, {
+                ...options,
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(options.headers || {})
+                }
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || result.ok === false) {
+                throw new Error(result.error || `Request failed (${response.status})`);
+            }
+            return result;
+        }
 
-            onlineUsersElement.replaceChildren();
+        function escapeText(value) {
+            return String(value ?? "");
+        }
 
-            if (!Array.isArray(users) || users.length === 0) {
-                const item = document.createElement("li");
-                item.textContent = "No users online";
-                onlineUsersElement.appendChild(item);
+        function conversationName(conversation) {
+            if (conversation.type === "group") return conversation.name || "Group";
+            const other = conversation.members.find(member => member.username !== currentUsername);
+            return other ? other.username : "Private chat";
+        }
+
+        function renderConversationList() {
+            const query = searchInput.value.trim().toLowerCase();
+            chatList.replaceChildren();
+
+            const filtered = conversations.filter(c =>
+                conversationName(c).toLowerCase().includes(query)
+            );
+
+            if (!filtered.length) {
+                const empty = document.createElement("div");
+                empty.className = "empty-note";
+                empty.textContent = query ? "No matching conversations." : "No chats yet. Start a new chat!";
+                chatList.appendChild(empty);
                 return;
             }
 
-            users.forEach((name) => {
-                const item = document.createElement("li");
-                item.textContent =
-                    name === currentUsername ? name + " (You)" : name;
-                onlineUsersElement.appendChild(item);
+            filtered.forEach(conversation => {
+                const item = document.createElement("button");
+                item.type = "button";
+                item.className = "chat-item" +
+                    (activeConversation?.id === conversation.id ? " active" : "");
+                item.addEventListener("click", () => openConversation(conversation));
+
+                const avatar = document.createElement("div");
+                avatar.className = "avatar";
+                avatar.textContent = conversation.type === "group" ? "👥" : "💬";
+
+                const details = document.createElement("div");
+                details.className = "chat-details";
+
+                const titleRow = document.createElement("div");
+                titleRow.className = "chat-title-row";
+
+                const title = document.createElement("span");
+                title.className = "chat-title";
+                title.textContent = conversationName(conversation);
+
+                const time = document.createElement("span");
+                time.className = "chat-time";
+                time.textContent = conversation.last_message
+                    ? new Date(conversation.last_message.created_at + "Z").toLocaleTimeString([], {
+                        hour: "2-digit", minute: "2-digit"
+                    }) : "";
+
+                const preview = document.createElement("div");
+                preview.className = "chat-preview";
+                const last = conversation.last_message;
+                preview.textContent = last
+                    ? `${last.sender === currentUsername ? "You" : last.sender}: ${last.body}`
+                    : (conversation.type === "group" ? "Group created" : "Start chatting");
+
+                titleRow.append(title, time);
+                details.append(titleRow, preview);
+                item.append(avatar, details);
+                chatList.appendChild(item);
             });
-        });
-
-        // Keep your other existing Socket.IO handlers below this line.
-
-
-        const statusElement = document.getElementById("status");
-        const messagesElement = document.getElementById("messages");
-        const messageForm = document.getElementById("messageForm");
-        const messageInput = document.getElementById("messageInput");
-        const sendButton = document.getElementById("sendButton");
-        const lastPreview = document.getElementById("lastPreview");
-        const lastTime = document.getElementById("lastTime");
-        const searchInput = document.getElementById("searchInput");
-        const globalChatItem = document.getElementById("globalChatItem");
-
-
+        }
 
         function scrollToBottom() {
             messagesElement.scrollTop = messagesElement.scrollHeight;
         }
 
-        function showTime() {
-            return new Date().toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit"
-            });
-        }
-
-        socket.on("connect", () => {
-            statusElement.textContent = "Online";
-            sendButton.disabled = false;
-        });
-
-        socket.on("disconnect", () => {
-            statusElement.textContent = "Reconnecting...";
-            sendButton.disabled = true;
-        });
-
-        socket.on("connect_error", (error) => {
-            console.error("Socket connection error:", error);
-            statusElement.textContent = "Connection error";
-            sendButton.disabled = true;
-        });
-
-        messageForm.addEventListener("submit", (event) => {
-            event.preventDefault();
-
-            const msg = messageInput.value.trim();
-
-            if (!msg || !socket.connected) {
-                return;
-            }
-
-            socket.emit("chat_message", { msg: msg });
-            messageInput.value = "";
-            messageInput.focus();
-        });
-
-        socket.on("new_message", (data) => {
-            if (!data ||
-                typeof data.username !== "string" ||
-                typeof data.msg !== "string") {
-                return;
-            }
+        function addMessage(message) {
+            if (!message || message.conversation_id !== activeConversation?.id) return;
 
             const bubble = document.createElement("div");
             bubble.className = "message";
-
-            if (data.username === currentUsername) {
+            if (message.sender === currentUsername) {
                 bubble.classList.add("mine");
             } else {
                 const author = document.createElement("div");
                 author.className = "message-author";
-                author.textContent = data.username;
+                author.textContent = message.sender || "Unknown";
                 bubble.appendChild(author);
             }
 
             const text = document.createElement("div");
             text.className = "message-text";
-            text.textContent = data.msg;
+            text.textContent = message.body || "";
 
             const meta = document.createElement("div");
             meta.className = "message-meta";
-
             const time = document.createElement("span");
-            time.textContent = showTime();
+            time.textContent = message.created_at
+                ? new Date(message.created_at + "Z").toLocaleTimeString([], {
+                    hour: "2-digit", minute: "2-digit"
+                })
+                : new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
             meta.appendChild(time);
-            bubble.appendChild(text);
-            bubble.appendChild(meta);
-
+            bubble.append(text, meta);
             messagesElement.appendChild(bubble);
-
-            lastPreview.textContent =
-                (data.username === currentUsername ? "You: " : data.username + ": ")
-                + data.msg;
-
-            lastTime.textContent = showTime();
-
             scrollToBottom();
-        });
 
-        searchInput.addEventListener("input", () => {
-            const query = searchInput.value.toLowerCase();
+            const conversation = conversations.find(c => c.id === message.conversation_id);
+            if (conversation) {
+                conversation.last_message = {
+                    sender: message.sender,
+                    body: message.body,
+                    created_at: message.created_at
+                };
+                renderConversationList();
+            }
+        }
 
-            globalChatItem.style.display =
-                "global chat".includes(query) ? "flex" : "none";
-        });
+        async function loadConversations() {
+            const result = await api("/api/conversations");
+            conversations = result.conversations || [];
+            renderConversationList();
 
-        globalChatItem.addEventListener("click", () => {
-            globalChatItem.classList.add("active");
+            if (!activeConversation && conversations.length) {
+                await openConversation(conversations[0]);
+            }
+        }
+
+        async function openConversation(conversation) {
+            if (activeConversation && socket.connected) {
+                socket.emit("leave_conversation", {
+                    conversation_id: activeConversation.id
+                });
+            }
+
+            activeConversation = conversation;
+            currentlyTyping.clear();
+            typingIndicator.textContent = "";
+
+            el("conversationTitle").textContent = conversationName(conversation);
+            el("conversationAvatar").textContent =
+                conversation.type === "group" ? "👥" : "💬";
+            statusElement.textContent = conversation.type === "group"
+                ? `${conversation.members.length} members`
+                : "Private conversation";
+
+            messageInput.disabled = false;
+            sendButton.disabled = !socket.connected;
+            messageInput.placeholder = "Type a message";
+
+            renderConversationList();
+            messagesElement.replaceChildren();
+
+            const label = document.createElement("div");
+            label.className = "day-label";
+            label.textContent = conversation.type === "group"
+                ? conversation.name : conversationName(conversation);
+            messagesElement.appendChild(label);
+
+            try {
+                const result = await api(
+                    `/api/conversations/${conversation.id}/messages`
+                );
+                result.messages.forEach(addMessage);
+                if (socket.connected) {
+                    socket.emit("join_conversation", {
+                        conversation_id: conversation.id
+                    });
+                }
+            } catch (error) {
+                showNotice(error.message);
+            }
+            messageInput.focus();
+        }
+
+        function showNotice(message) {
+            const notice = document.createElement("div");
+            notice.className = "empty-note";
+            notice.textContent = message;
+            messagesElement.appendChild(notice);
+        }
+
+        async function createPrivateChat() {
+            const username = prompt("Enter the exact username to chat with:");
+            if (!username || !username.trim()) return;
+
+            try {
+                const result = await api("/api/conversations/private", {
+                    method: "POST",
+                    body: JSON.stringify({ username: username.trim() })
+                });
+                await loadConversations();
+                const match = conversations.find(c => c.id === result.conversation.id);
+                if (match) await openConversation(match);
+            } catch (error) {
+                alert(error.message);
+            }
+        }
+
+        async function createGroupChat() {
+            const name = prompt("Enter a group name:");
+            if (!name || !name.trim()) return;
+
+            const membersText = prompt(
+                "Enter member usernames separated by commas.\nYou will be added automatically:"
+            );
+            if (membersText === null) return;
+
+            const members = membersText.split(",").map(value => value.trim()).filter(Boolean);
+            try {
+                const result = await api("/api/conversations/group", {
+                    method: "POST",
+                    body: JSON.stringify({ name: name.trim(), members })
+                });
+                await loadConversations();
+                const match = conversations.find(c => c.id === result.conversation.id);
+                if (match) await openConversation(match);
+            } catch (error) {
+                alert(error.message);
+            }
+        }
+
+        messageForm.addEventListener("submit", event => {
+            event.preventDefault();
+            const msg = messageInput.value.trim();
+
+            if (!msg || !activeConversation || !socket.connected) return;
+
+            socket.emit("chat_message", {
+                msg,
+                conversation_id: activeConversation.id
+            });
+            messageInput.value = "";
+            socket.emit("typing", {
+                conversation_id: activeConversation.id,
+                is_typing: false
+            });
             messageInput.focus();
         });
 
-        scrollToBottom();
+        messageInput.addEventListener("input", () => {
+            if (!activeConversation || !socket.connected) return;
+
+            socket.emit("typing", {
+                conversation_id: activeConversation.id,
+                is_typing: true
+            });
+
+            clearTimeout(typingTimer);
+            typingTimer = setTimeout(() => {
+                if (activeConversation && socket.connected) {
+                    socket.emit("typing", {
+                        conversation_id: activeConversation.id,
+                        is_typing: false
+                    });
+                }
+            }, 1200);
+        });
+
+        socket.on("connect", async () => {
+            statusElement.textContent = activeConversation
+                ? "Connected" : "Online";
+            sendButton.disabled = !activeConversation;
+            socket.emit("get_presence");
+
+            if (activeConversation) {
+                socket.emit("join_conversation", {
+                    conversation_id: activeConversation.id
+                });
+            }
+        });
+
+        socket.on("disconnect", () => {
+            statusElement.textContent = "Reconnecting…";
+            sendButton.disabled = true;
+        });
+
+        socket.on("connect_error", error => {
+            console.error("Socket connection error:", error);
+            statusElement.textContent = "Connection error";
+        });
+
+        socket.on("joined_conversation", data => {
+            if (data.conversation_id === activeConversation?.id) {
+                statusElement.textContent = "Connected";
+            }
+        });
+
+        socket.on("new_message", data => {
+            addMessage(data);
+        });
+
+        socket.on("presence_update", data => {
+            const users = data?.online_users || [];
+            onlineUsersElement.replaceChildren();
+
+            if (!users.length) {
+                const li = document.createElement("li");
+                li.textContent = "No users online";
+                onlineUsersElement.appendChild(li);
+                return;
+            }
+
+            users.forEach(name => {
+                const li = document.createElement("li");
+                const dot = document.createElement("span");
+                dot.className = "online-dot";
+                li.append(dot, document.createTextNode(
+                    name === currentUsername ? `${name} (You)` : name
+                ));
+                onlineUsersElement.appendChild(li);
+            });
+        });
+
+        socket.on("user_typing", data => {
+            if (!activeConversation ||
+                data.conversation_id !== activeConversation.id ||
+                data.username === currentUsername) return;
+
+            if (data.is_typing) currentlyTyping.add(data.username);
+            else currentlyTyping.delete(data.username);
+
+            typingIndicator.textContent = currentlyTyping.size
+                ? `${Array.from(currentlyTyping).join(", ")} typing…`
+                : "";
+        });
+
+        socket.on("chat_error", data => {
+            showNotice(data?.msg || "A chat error occurred.");
+        });
+
+        searchInput.addEventListener("input", renderConversationList);
+        el("newPrivateButton").addEventListener("click", createPrivateChat);
+        el("newGroupButton").addEventListener("click", createGroupChat);
+
+        loadConversations().catch(error => {
+            chatList.replaceChildren();
+            const note = document.createElement("div");
+            note.className = "empty-note";
+            note.textContent = error.message;
+            chatList.appendChild(note);
+        });
+}) ();
     </script>
 </body>
 
