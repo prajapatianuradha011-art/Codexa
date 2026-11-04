@@ -198,7 +198,7 @@ button {
     box-shadow: 0 0 0 3px rgba(0, 168, 132, .08);
 }
 
-.search-box>span {
+.search-box > span {
     font-size: 21px;
     line-height: 1;
 }
@@ -574,7 +574,6 @@ input:focus-visible {
         opacity: 0;
         transform: translateY(5px);
     }
-
     to {
         opacity: 1;
         transform: translateY(0);
@@ -664,7 +663,6 @@ input:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
-
     *,
     *::before,
     *::after {
