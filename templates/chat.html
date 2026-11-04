@@ -22,6 +22,7 @@
 
     <div class="sidebar-actions">
       <button class="new-chat-button" id="newPrivateButton" type="button">＋ New chat</button>
+      <button class="new-chat-button secondary" id="newGroupButton" type="button">＋ New group</button>
     </div>
 
     <div class="search-area">
@@ -100,6 +101,7 @@
   }
 
   function conversationName(conversation) {
+    if (conversation.type === "group") return conversation.name || "Group";
     const other = conversation.members.find(member => member.username !== currentUsername);
     return other ? other.username : "Private chat";
   }
@@ -223,8 +225,11 @@
 
     const name = conversationName(conversation);
     el("conversationTitle").textContent = name;
-    el("conversationAvatar").textContent = name.slice(0, 1).toUpperCase();
-    statusElement.textContent = "Private conversation";
+    el("conversationAvatar").textContent = conversation.type === "group"
+      ? "👥" : name.slice(0, 1).toUpperCase();
+    statusElement.textContent = conversation.type === "group"
+      ? `${conversation.members.length} members`
+      : "Private conversation";
 
     messageInput.disabled = false;
     sendButton.disabled = !socket.connected;
@@ -261,6 +266,34 @@
       const result = await api("/api/conversations/private", {
         method: "POST",
         body: JSON.stringify({ username: username.trim() })
+      });
+      await loadConversations();
+      const match = conversations.find(c => c.id === result.conversation.id);
+      if (match) await openConversation(match);
+    } catch (error) {
+      alert(error.message);
+    }
+  }
+
+  async function createGroupChat() {
+    const name = prompt("Enter a group name:");
+    if (!name || !name.trim()) return;
+
+    const membersText = prompt(
+      "Enter usernames separated by commas (you will be added automatically):"
+    );
+    if (membersText === null) return;
+
+    const members = membersText.split(",").map(value => value.trim()).filter(Boolean);
+    if (!members.length) {
+      alert("Add at least one other member.");
+      return;
+    }
+
+    try {
+      const result = await api("/api/conversations/group", {
+        method: "POST",
+        body: JSON.stringify({ name: name.trim(), members })
       });
       await loadConversations();
       const match = conversations.find(c => c.id === result.conversation.id);
@@ -366,6 +399,7 @@
 
   searchInput.addEventListener("input", renderConversationList);
   el("newPrivateButton").addEventListener("click", createPrivateChat);
+  el("newGroupButton").addEventListener("click", createGroupChat);
 
   loadConversations().catch(error => {
     chatList.replaceChildren();
