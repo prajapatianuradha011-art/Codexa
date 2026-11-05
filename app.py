@@ -15,6 +15,7 @@ socketio = SocketIO(app, cors_allowed_origins=None)
 DATABASE = os.path.join(app.root_path, "chat.db")
 MAX_MESSAGE_LENGTH = 2000
 MAX_VOICE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_AVATAR_BYTES = 3 * 1024 * 1024
 AVATAR_FOLDER = os.path.join(app.root_path, "static", "profile_photos")
 os.makedirs(AVATAR_FOLDER, exist_ok=True)
@@ -22,6 +23,9 @@ ALLOWED_AVATAR_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 VOICE_FOLDER = os.path.join(app.root_path, "static", "voice_uploads")
 os.makedirs(VOICE_FOLDER, exist_ok=True)
 ALLOWED_AUDIO_EXTENSIONS = {".webm", ".ogg", ".mp4", ".m4a", ".wav"}
+IMAGE_FOLDER = os.path.join(app.root_path, "static", "chat_images")
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # Tracks active Socket.IO connections per authenticated user.
 online_sockets = defaultdict(set)
@@ -491,6 +495,78 @@ def leave_conversation(data):
         leave_room(f"conversation:{cid}")
 
 
+def call_participants(cid, uid):
+    """Return the other member only for a valid one-to-one conversation."""
+    with get_db() as conn:
+        row = conn.execute("SELECT type FROM conversations WHERE id = ?", (cid,)).fetchone()
+        if not row or row["type"] != "private" or not is_member(conn, cid, uid):
+            return None
+        members = [r["user_id"] for r in conn.execute(
+            "SELECT user_id FROM conversation_members WHERE conversation_id = ?", (cid,)
+        ).fetchall()]
+        if len(members) != 2:
+            return None
+        peer = next((member for member in members if member != uid), None)
+        return peer
+
+
+@socketio.on("call_invite")
+def call_invite(data):
+    uid = socket_users.get(request.sid)
+    data = data if isinstance(data, dict) else {}
+    cid, mode = data.get("conversation_id"), data.get("mode")
+    if uid is None or not isinstance(cid, int) or mode not in ("audio", "video"):
+        return emit("call_error", {"message": "Invalid call request."})
+    peer = call_participants(cid, uid)
+    if peer is None:
+        return emit("call_error", {"message": "Calls are available only in one-to-one chats."})
+    if not online_sockets.get(peer):
+        return emit("call_error", {"message": "This user is offline."})
+    with get_db() as conn:
+        caller = conn.execute("SELECT username, display_name FROM users WHERE id = ?", (uid,)).fetchone()
+    socketio.emit("incoming_call", {
+        "conversation_id": cid, "mode": mode, "caller_id": uid,
+        "caller_name": caller["display_name"] or caller["username"]
+    }, room=f"user:{peer}")
+    emit("call_ringing", {"conversation_id": cid, "mode": mode})
+
+
+@socketio.on("call_response")
+def call_response(data):
+    uid = socket_users.get(request.sid)
+    data = data if isinstance(data, dict) else {}
+    cid, accepted = data.get("conversation_id"), data.get("accepted") is True
+    if uid is None or not isinstance(cid, int): return
+    peer = call_participants(cid, uid)
+    if peer is None: return
+    socketio.emit("call_response", {"conversation_id": cid, "accepted": accepted}, room=f"user:{peer}")
+
+
+@socketio.on("call_signal")
+def call_signal(data):
+    uid = socket_users.get(request.sid)
+    data = data if isinstance(data, dict) else {}
+    cid, signal = data.get("conversation_id"), data.get("signal")
+    if uid is None or not isinstance(cid, int) or not isinstance(signal, dict): return
+    peer = call_participants(cid, uid)
+    if peer is None: return
+    # Only relay the WebRTC offer, answer and ICE candidate payloads.
+    if signal.get("type") not in ("offer", "answer", "ice"):
+        return
+    socketio.emit("call_signal", {"conversation_id": cid, "signal": signal}, room=f"user:{peer}")
+
+
+@socketio.on("call_end")
+def call_end(data):
+    uid = socket_users.get(request.sid)
+    data = data if isinstance(data, dict) else {}
+    cid = data.get("conversation_id")
+    if uid is None or not isinstance(cid, int): return
+    peer = call_participants(cid, uid)
+    if peer is not None:
+        socketio.emit("call_ended", {"conversation_id": cid}, room=f"user:{peer}")
+
+
 @socketio.on("chat_message")
 def handle_chat_message(data):
     uid = socket_users.get(request.sid)
@@ -579,6 +655,50 @@ def upload_voice_message():
     return jsonify({"media_url": url_for("static", filename=f"voice_uploads/{filename}")})
 
 
+@app.route("/api/image-upload", methods=["POST"])
+def upload_chat_image():
+    user = get_logged_in_user()
+    if not user:
+        return jsonify({"error": "Login required"}), 401
+
+    try:
+        cid = int(request.form.get("conversation_id", ""))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Select a conversation first."}), 400
+
+    with get_db() as conn:
+        if not is_member(conn, cid, user["id"]):
+            return jsonify({"error": "Conversation not found."}), 404
+
+    image_file = request.files.get("image")
+    if not image_file or not image_file.filename:
+        return jsonify({"error": "Choose an image to send."}), 400
+    extension = Path(image_file.filename).suffix.lower()
+    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+        return jsonify({"error": "Use PNG, JPG, GIF or WEBP images."}), 400
+
+    content = image_file.stream.read(MAX_IMAGE_BYTES + 1)
+    if not content:
+        return jsonify({"error": "The selected image is empty."}), 400
+    if len(content) > MAX_IMAGE_BYTES:
+        return jsonify({"error": "Images must be 8 MB or smaller."}), 413
+
+    # Verify the actual file signature instead of trusting the filename or browser MIME type.
+    valid = (
+        (extension == ".png" and content.startswith(b"\x89PNG\r\n\x1a\n"))
+        or (extension in (".jpg", ".jpeg") and content.startswith(b"\xff\xd8\xff"))
+        or (extension == ".gif" and content[:6] in (b"GIF87a", b"GIF89a"))
+        or (extension == ".webp" and content[:4] == b"RIFF" and content[8:12] == b"WEBP")
+    )
+    if not valid:
+        return jsonify({"error": "The uploaded file is not a valid image of that type."}), 400
+
+    filename = f"{uuid.uuid4().hex}{extension}"
+    with open(os.path.join(IMAGE_FOLDER, filename), "wb") as output:
+        output.write(content)
+    return jsonify({"media_url": url_for("static", filename=f"chat_images/{filename}")})
+
+
 @socketio.on("voice_message")
 def handle_voice_message(data):
     uid = socket_users.get(request.sid)
@@ -631,6 +751,55 @@ def handle_voice_message(data):
     except sqlite3.Error:
         app.logger.exception("Could not save voice message")
         emit("chat_error", {"msg": "Voice message could not be saved."})
+
+
+@socketio.on("image_message")
+def handle_image_message(data):
+    uid = socket_users.get(request.sid)
+    if uid is None or not isinstance(data, dict):
+        emit("chat_error", {"msg": "Please log in again."})
+        return
+    cid, media_url = data.get("conversation_id"), data.get("media_url")
+    if not isinstance(cid, int) or not isinstance(media_url, str):
+        emit("chat_error", {"msg": "Invalid image message."})
+        return
+    if not media_url.startswith("/static/chat_images/") or ".." in media_url:
+        emit("chat_error", {"msg": "Invalid image location."})
+        return
+    try:
+        with get_db() as conn:
+            if not is_member(conn, cid, uid):
+                emit("chat_error", {"msg": "You are not a member of this conversation."})
+                return
+            members = conn.execute("""
+                SELECT u.id, u.username FROM conversation_members cm
+                JOIN users u ON u.id = cm.user_id WHERE cm.conversation_id = ?
+            """, (cid,)).fetchall()
+            sender = next((m for m in members if m["id"] == uid), None)
+            others = [m for m in members if m["id"] != uid]
+            if not sender or not others:
+                emit("chat_error", {"msg": "Invalid conversation."})
+                return
+            kind = conn.execute("SELECT type FROM conversations WHERE id = ?", (cid,)).fetchone()["type"]
+            receiver_id = others[0]["id"] if kind == "private" else None
+            cur = conn.execute("""
+                INSERT INTO messages
+                (username, msg, sender_id, receiver_id, conversation_id, is_read, message_type, media_url)
+                VALUES (?, 'Image', ?, ?, ?, 0, 'image', ?)
+            """, (sender["username"], uid, receiver_id, cid, media_url))
+            mid = cur.lastrowid
+            created = conn.execute("SELECT created_at FROM messages WHERE id = ?", (mid,)).fetchone()["created_at"]
+        payload = {
+            "id": mid, "conversation_id": cid, "sender": sender["username"],
+            "body": "Image", "created_at": created, "message_type": "image",
+            "media_url": media_url
+        }
+        for member in others:
+            socketio.emit("new_message", payload, room=f"user:{member['id']}")
+        emit("message_sent", payload)
+    except sqlite3.Error:
+        app.logger.exception("Could not save image message")
+        emit("chat_error", {"msg": "Image message could not be saved."})
 
 
 @socketio.on("typing")
