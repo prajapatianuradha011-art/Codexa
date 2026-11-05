@@ -10,12 +10,14 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-only-change-this-secret")
+app.config["MAX_CONTENT_LENGTH"] = 51 * 1024 * 1024
 socketio = SocketIO(app, cors_allowed_origins=None)
 
 DATABASE = os.path.join(app.root_path, "chat.db")
 MAX_MESSAGE_LENGTH = 2000
 MAX_VOICE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
 MAX_AVATAR_BYTES = 3 * 1024 * 1024
 AVATAR_FOLDER = os.path.join(app.root_path, "static", "profile_photos")
 os.makedirs(AVATAR_FOLDER, exist_ok=True)
@@ -26,6 +28,9 @@ ALLOWED_AUDIO_EXTENSIONS = {".webm", ".ogg", ".mp4", ".m4a", ".wav"}
 IMAGE_FOLDER = os.path.join(app.root_path, "static", "chat_images")
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+VIDEO_FOLDER = os.path.join(app.root_path, "static", "chat_videos")
+os.makedirs(VIDEO_FOLDER, exist_ok=True)
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov"}
 
 # Tracks active Socket.IO connections per authenticated user.
 online_sockets = defaultdict(set)
@@ -85,6 +90,7 @@ def init_db():
             "message_type": "TEXT NOT NULL DEFAULT 'text'",
             "media_url": "TEXT",
             "duration": "REAL",
+            "edited": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, definition in additions.items():
             if column not in message_columns:
@@ -412,7 +418,7 @@ def api_messages(conversation_id):
 
         rows = conn.execute("""
             SELECT id, conversation_id, username AS sender,
-                   msg AS body, created_at, message_type, media_url, duration
+                   msg AS body, created_at, message_type, media_url, duration, edited
             FROM messages
             WHERE conversation_id = ?
             ORDER BY id ASC
@@ -633,6 +639,68 @@ def handle_chat_message(data):
         emit("chat_error", {"msg": "Message could not be saved. Please try again."})
 
 
+@socketio.on("edit_message")
+def handle_edit_message(data):
+    uid = socket_users.get(request.sid)
+    if uid is None or not isinstance(data, dict):
+        emit("chat_error", {"msg": "Please log in again."})
+        return
+    mid, body = data.get("message_id"), data.get("body")
+    if not isinstance(mid, int) or not isinstance(body, str):
+        emit("chat_error", {"msg": "Invalid edit request."})
+        return
+    body = body.strip()
+    if not body or len(body) > MAX_MESSAGE_LENGTH:
+        emit("chat_error", {"msg": f"Edited message must contain 1-{MAX_MESSAGE_LENGTH} characters."})
+        return
+    with get_db() as conn:
+        row = conn.execute("""SELECT id, conversation_id, sender_id, username, message_type
+                              FROM messages WHERE id = ?""", (mid,)).fetchone()
+        if not row or row["sender_id"] != uid or not is_member(conn, row["conversation_id"], uid):
+            emit("chat_error", {"msg": "You can edit only your own messages."})
+            return
+        if row["message_type"] != "text":
+            emit("chat_error", {"msg": "Only text messages can be edited."})
+            return
+        conn.execute("UPDATE messages SET msg = ?, edited = 1 WHERE id = ?", (body, mid))
+        members = [r["user_id"] for r in conn.execute(
+            "SELECT user_id FROM conversation_members WHERE conversation_id = ?", (row["conversation_id"],)
+        ).fetchall()]
+        created = conn.execute("SELECT created_at FROM messages WHERE id = ?", (mid,)).fetchone()["created_at"]
+    payload = {"id": mid, "conversation_id": row["conversation_id"], "sender": row["username"],
+               "body": body, "created_at": created, "message_type": "text", "edited": 1}
+    for member_id in members:
+        socketio.emit("message_updated", payload, room=f"user:{member_id}")
+
+
+@socketio.on("delete_message")
+def handle_delete_message(data):
+    uid = socket_users.get(request.sid)
+    if uid is None or not isinstance(data, dict):
+        emit("chat_error", {"msg": "Please log in again."})
+        return
+    mid = data.get("message_id")
+    if not isinstance(mid, int):
+        emit("chat_error", {"msg": "Invalid delete request."})
+        return
+    with get_db() as conn:
+        row = conn.execute("""SELECT id, conversation_id, sender_id, username
+                              FROM messages WHERE id = ?""", (mid,)).fetchone()
+        if not row or row["sender_id"] != uid or not is_member(conn, row["conversation_id"], uid):
+            emit("chat_error", {"msg": "You can delete only your own messages."})
+            return
+        conn.execute("""UPDATE messages SET msg = 'This message was deleted',
+                       message_type = 'deleted', media_url = NULL, duration = NULL, edited = 0
+                       WHERE id = ?""", (mid,))
+        members = [r["user_id"] for r in conn.execute(
+            "SELECT user_id FROM conversation_members WHERE conversation_id = ?", (row["conversation_id"],)
+        ).fetchall()]
+    payload = {"id": mid, "conversation_id": row["conversation_id"], "sender": row["username"],
+               "body": "This message was deleted", "message_type": "deleted", "deleted": True}
+    for member_id in members:
+        socketio.emit("message_deleted", payload, room=f"user:{member_id}")
+
+
 @app.route("/api/voice-upload", methods=["POST"])
 def upload_voice_message():
     user = get_logged_in_user()
@@ -697,6 +765,40 @@ def upload_chat_image():
     with open(os.path.join(IMAGE_FOLDER, filename), "wb") as output:
         output.write(content)
     return jsonify({"media_url": url_for("static", filename=f"chat_images/{filename}")})
+
+
+@app.route("/api/video-upload", methods=["POST"])
+def upload_chat_video():
+    user = get_logged_in_user()
+    if not user:
+        return jsonify({"error": "Login required"}), 401
+    try:
+        cid = int(request.form.get("conversation_id", ""))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Select a conversation first."}), 400
+    with get_db() as conn:
+        if not is_member(conn, cid, user["id"]):
+            return jsonify({"error": "Conversation not found."}), 404
+    video_file = request.files.get("video")
+    if not video_file or not video_file.filename:
+        return jsonify({"error": "Choose a video to send."}), 400
+    extension = Path(video_file.filename).suffix.lower()
+    if extension not in ALLOWED_VIDEO_EXTENSIONS:
+        return jsonify({"error": "Use MP4, WEBM or MOV video files."}), 400
+    content = video_file.stream.read(MAX_VIDEO_BYTES + 1)
+    if not content:
+        return jsonify({"error": "The selected video is empty."}), 400
+    if len(content) > MAX_VIDEO_BYTES:
+        return jsonify({"error": "Videos must be 50 MB or smaller."}), 413
+    # Check container signatures; browser MIME type and filename are not trusted.
+    valid = ((extension in (".mp4", ".mov") and len(content) >= 12 and content[4:8] == b"ftyp")
+             or (extension == ".webm" and content.startswith(bytes.fromhex("1A45DFA3"))))
+    if not valid:
+        return jsonify({"error": "The uploaded file is not a valid video of that type."}), 400
+    filename = f"{uuid.uuid4().hex}{extension}"
+    with open(os.path.join(VIDEO_FOLDER, filename), "wb") as output:
+        output.write(content)
+    return jsonify({"media_url": url_for("static", filename=f"chat_videos/{filename}")})
 
 
 @socketio.on("voice_message")
@@ -800,6 +902,52 @@ def handle_image_message(data):
     except sqlite3.Error:
         app.logger.exception("Could not save image message")
         emit("chat_error", {"msg": "Image message could not be saved."})
+
+
+@socketio.on("video_message")
+def handle_video_message(data):
+    uid = socket_users.get(request.sid)
+    if uid is None or not isinstance(data, dict):
+        emit("chat_error", {"msg": "Please log in again."})
+        return
+    cid, media_url = data.get("conversation_id"), data.get("media_url")
+    if not isinstance(cid, int) or not isinstance(media_url, str):
+        emit("chat_error", {"msg": "Invalid video message."})
+        return
+    if not media_url.startswith("/static/chat_videos/") or ".." in media_url:
+        emit("chat_error", {"msg": "Invalid video location."})
+        return
+    try:
+        with get_db() as conn:
+            if not is_member(conn, cid, uid):
+                emit("chat_error", {"msg": "You are not a member of this conversation."})
+                return
+            members = conn.execute("""
+                SELECT u.id, u.username FROM conversation_members cm
+                JOIN users u ON u.id = cm.user_id WHERE cm.conversation_id = ?
+            """, (cid,)).fetchall()
+            sender = next((m for m in members if m["id"] == uid), None)
+            others = [m for m in members if m["id"] != uid]
+            if not sender or not others:
+                emit("chat_error", {"msg": "Invalid conversation."})
+                return
+            kind = conn.execute("SELECT type FROM conversations WHERE id = ?", (cid,)).fetchone()["type"]
+            receiver_id = others[0]["id"] if kind == "private" else None
+            cur = conn.execute("""
+                INSERT INTO messages
+                (username, msg, sender_id, receiver_id, conversation_id, is_read, message_type, media_url)
+                VALUES (?, 'Video', ?, ?, ?, 0, 'video', ?)
+            """, (sender["username"], uid, receiver_id, cid, media_url))
+            mid = cur.lastrowid
+            created = conn.execute("SELECT created_at FROM messages WHERE id = ?", (mid,)).fetchone()["created_at"]
+        payload = {"id": mid, "conversation_id": cid, "sender": sender["username"],
+                   "body": "Video", "created_at": created, "message_type": "video", "media_url": media_url}
+        for member in others:
+            socketio.emit("new_message", payload, room=f"user:{member['id']}")
+        emit("message_sent", payload)
+    except sqlite3.Error:
+        app.logger.exception("Could not save video message")
+        emit("chat_error", {"msg": "Video message could not be saved."})
 
 
 @socketio.on("typing")
