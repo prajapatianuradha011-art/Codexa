@@ -15,6 +15,10 @@ socketio = SocketIO(app, cors_allowed_origins=None)
 DATABASE = os.path.join(app.root_path, "chat.db")
 MAX_MESSAGE_LENGTH = 2000
 MAX_VOICE_BYTES = 8 * 1024 * 1024
+MAX_AVATAR_BYTES = 3 * 1024 * 1024
+AVATAR_FOLDER = os.path.join(app.root_path, "static", "profile_photos")
+os.makedirs(AVATAR_FOLDER, exist_ok=True)
+ALLOWED_AVATAR_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 VOICE_FOLDER = os.path.join(app.root_path, "static", "voice_uploads")
 os.makedirs(VOICE_FOLDER, exist_ok=True)
 ALLOWED_AUDIO_EXTENSIONS = {".webm", ".ogg", ".mp4", ".m4a", ".wav"}
@@ -37,9 +41,25 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL
+                password TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                bio TEXT NOT NULL DEFAULT '',
+                avatar_url TEXT,
+                last_seen TEXT
             )
         """)
+        user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        user_additions = {
+            "display_name": "TEXT NOT NULL DEFAULT ''",
+            "bio": "TEXT NOT NULL DEFAULT ''",
+            "avatar_url": "TEXT",
+            "last_seen": "TEXT",
+        }
+        for column, definition in user_additions.items():
+            if column not in user_columns:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+        conn.execute("UPDATE users SET display_name = username WHERE display_name = ''")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,6 +161,16 @@ def is_member(conn, conversation_id, user_id):
     """, (conversation_id, user_id)).fetchone() is not None
 
 
+def user_profile_payload(conn, user_id):
+    row = conn.execute("""
+        SELECT id, username, display_name, bio, avatar_url, last_seen
+        FROM users WHERE id = ?
+    """, (user_id,)).fetchone()
+    if not row:
+        return None
+    return dict(row)
+
+
 def conversation_payload(conn, conversation_id, current_user_id):
     conversation = conn.execute(
         "SELECT id, type FROM conversations WHERE id = ?", (conversation_id,)
@@ -149,7 +179,7 @@ def conversation_payload(conn, conversation_id, current_user_id):
         return None
 
     members = conn.execute("""
-        SELECT u.id, u.username
+        SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.last_seen
         FROM conversation_members cm
         JOIN users u ON u.id = cm.user_id
         WHERE cm.conversation_id = ?
@@ -166,7 +196,7 @@ def conversation_payload(conn, conversation_id, current_user_id):
     return {
         "id": conversation["id"],
         "type": conversation["type"],
-        "members": [{"id": m["id"], "username": m["username"]} for m in members],
+        "members": [dict(m) for m in members],
         "last_message": dict(last) if last else None,
     }
 
@@ -213,6 +243,8 @@ def login():
                         (generate_password_hash(password), user["id"])
                     )
         if valid:
+            with get_db() as conn:
+                conn.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],))
             session.clear()
             session["user_id"] = user["id"]
             session["user"] = user["username"]
@@ -233,6 +265,72 @@ def home():
     if not user:
         return redirect(url_for("login"))
     return render_template("chat.html", username=user["username"])
+
+
+@app.route("/api/profile", methods=["GET", "PUT"])
+def api_my_profile():
+    user = get_logged_in_user()
+    if not user:
+        return jsonify({"error": "Login required"}), 401
+    if request.method == "GET":
+        with get_db() as conn:
+            profile = user_profile_payload(conn, user["id"])
+        profile["is_online"] = bool(online_sockets.get(user["id"]))
+        return jsonify({"profile": profile})
+
+    data = request.get_json(silent=True) or {}
+    display_name = data.get("display_name", "")
+    bio = data.get("bio", "")
+    if not isinstance(display_name, str) or not display_name.strip() or len(display_name.strip()) > 40:
+        return jsonify({"error": "Display name must be 1-40 characters."}), 400
+    if not isinstance(bio, str) or len(bio) > 160:
+        return jsonify({"error": "Bio must be 160 characters or fewer."}), 400
+    with get_db() as conn:
+        conn.execute("UPDATE users SET display_name = ?, bio = ? WHERE id = ?",
+                     (display_name.strip(), bio.strip(), user["id"]))
+        profile = user_profile_payload(conn, user["id"])
+    profile["is_online"] = bool(online_sockets.get(user["id"]))
+    return jsonify({"profile": profile})
+
+
+@app.route("/api/profile/avatar", methods=["POST"])
+def upload_profile_avatar():
+    user = get_logged_in_user()
+    if not user:
+        return jsonify({"error": "Login required"}), 401
+    photo = request.files.get("photo")
+    if not photo or not photo.filename:
+        return jsonify({"error": "Choose an image first."}), 400
+    extension = Path(photo.filename).suffix.lower()
+    if extension not in ALLOWED_AVATAR_EXTENSIONS or not (photo.mimetype or "").startswith("image/"):
+        return jsonify({"error": "Use a PNG, JPG, WEBP or GIF image."}), 400
+    content = photo.stream.read(MAX_AVATAR_BYTES + 1)
+    if not content:
+        return jsonify({"error": "The image is empty."}), 400
+    if len(content) > MAX_AVATAR_BYTES:
+        return jsonify({"error": "Profile photos must be 3 MB or smaller."}), 413
+    filename = f"{uuid.uuid4().hex}{extension}"
+    with open(os.path.join(AVATAR_FOLDER, filename), "wb") as output:
+        output.write(content)
+    avatar_url = url_for("static", filename=f"profile_photos/{filename}")
+    with get_db() as conn:
+        conn.execute("UPDATE users SET avatar_url = ? WHERE id = ?", (avatar_url, user["id"]))
+        profile = user_profile_payload(conn, user["id"])
+    profile["is_online"] = bool(online_sockets.get(user["id"]))
+    return jsonify({"profile": profile})
+
+
+@app.route("/api/users/<int:user_id>/profile")
+def api_user_profile(user_id):
+    user = get_logged_in_user()
+    if not user:
+        return jsonify({"error": "Login required"}), 401
+    with get_db() as conn:
+        profile = user_profile_payload(conn, user_id)
+    if not profile:
+        return jsonify({"error": "User not found."}), 404
+    profile["is_online"] = bool(online_sockets.get(user_id))
+    return jsonify({"profile": profile})
 
 
 @app.route("/api/conversations")
@@ -347,6 +445,8 @@ def socket_disconnect():
         online_sockets[uid].discard(request.sid)
         if not online_sockets[uid]:
             online_sockets.pop(uid, None)
+            with get_db() as conn:
+                conn.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (uid,))
         socketio.emit("presence_update", {
             "online_users": get_online_usernames()
         })
@@ -562,4 +662,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
-
