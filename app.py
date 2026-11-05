@@ -68,6 +68,15 @@ def init_db():
             if column not in user_columns:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
         conn.execute("UPDATE users SET display_name = username WHERE display_name = ''")
+        # Usernames are unique regardless of letter case (e.g. Raghav == raghav).
+        # Existing databases may already contain case-only duplicates; signup also
+        # checks under a write lock so new duplicates are blocked in that case too.
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)")
+        except sqlite3.IntegrityError:
+            # Do not modify existing accounts automatically. The signup route below
+            # still prevents any additional case-insensitive duplicates.
+            pass
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -222,12 +231,23 @@ def signup():
             return "Password must be at least 8 characters.", 400
         try:
             with get_db() as conn:
+                # Serialize registration attempts to avoid two simultaneous signups
+                # passing the duplicate check at the same time.
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT id FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
+                    (username,)
+                ).fetchone()
+                if existing:
+                    conn.rollback()
+                    return "This username is already taken. Please choose another username.", 409
                 conn.execute(
                     "INSERT INTO users (username, password) VALUES (?, ?)",
                     (username, generate_password_hash(password))
                 )
+                conn.commit()
         except sqlite3.IntegrityError:
-            return "Username already exists.", 409
+            return "This username is already taken. Please choose another username.", 409
         return redirect(url_for("login"))
     return render_template("signup.html")
 
