@@ -50,6 +50,10 @@
           <div class="header-status" id="status">Connecting…</div>
         </div>
       </div>
+      <div class="call-actions">
+        <button class="call-button" id="audioCallButton" type="button" title="Voice call" disabled>☎</button>
+        <button class="call-button" id="videoCallButton" type="button" title="Video call" disabled>▣</button>
+      </div>
     </header>
 
     <section class="messages" id="messages" aria-live="polite">
@@ -60,6 +64,8 @@
     <div class="typing-indicator" id="typingIndicator" aria-live="polite"></div>
 
     <form class="composer" id="messageForm">
+      <button class="composer-tool" id="imageButton" type="button" title="Send image" disabled>📷</button>
+      <input id="imageInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
       <button class="composer-tool" id="emojiButton" type="button" title="Add emoji" disabled>😊</button>
       <input id="messageInput" type="text" placeholder="Select a conversation first"
              maxlength="2000" autocomplete="off" disabled required>
@@ -69,6 +75,23 @@
     </form>
     <div class="voice-status" id="voiceStatus" aria-live="polite"></div>
   </main>
+</div>
+
+
+<div class="call-modal-backdrop" id="callModal" hidden>
+  <section class="call-modal" role="dialog" aria-modal="true" aria-labelledby="callTitle">
+    <h2 id="callTitle">Call</h2>
+    <p id="callStatus">Connecting…</p>
+    <div class="call-videos" id="callVideos">
+      <video id="remoteVideo" autoplay playsinline></video>
+      <video id="localVideo" autoplay muted playsinline></video>
+    </div>
+    <div class="call-modal-actions">
+      <button class="call-button accept" id="acceptCallButton" type="button" hidden>Accept</button>
+      <button class="call-button decline" id="declineCallButton" type="button" hidden>Decline</button>
+      <button class="call-button decline" id="endCallButton" type="button" hidden>End call</button>
+    </div>
+  </section>
 </div>
 
 <div class="profile-modal-backdrop" id="profileModal" hidden>
@@ -113,12 +136,103 @@
   const onlineUsersElement = el("onlineUsers");
   const typingIndicator = el("typingIndicator");
   const emojiButton = el("emojiButton");
+  const imageButton = el("imageButton");
+  const imageInput = el("imageInput");
   const emojiPicker = el("emojiPicker");
   const voiceButton = el("voiceButton");
   const voiceStatus = el("voiceStatus");
   const profileModal = el("profileModal");
   let myProfile = null;
   let viewedProfile = null;
+  let peerConnection = null;
+  let localCallStream = null;
+  let pendingOffer = null;
+  let pendingIceCandidates = [];
+  let callMode = null;
+  let callConversationId = null;
+  const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+  function showCallModal(title, status) {
+    el("callTitle").textContent = title;
+    el("callStatus").textContent = status;
+    el("callModal").hidden = false;
+  }
+  function closeCallModal() { el("callModal").hidden = true; }
+  function otherMember() {
+    return activeConversation?.members?.find(member => member.username !== currentUsername);
+  }
+  function sendCallSignal(signal) {
+    if (callConversationId && socket.connected) socket.emit("call_signal", {
+      conversation_id: callConversationId, signal
+    });
+  }
+  async function preparePeerConnection() {
+    peerConnection = new RTCPeerConnection(rtcConfig);
+    peerConnection.onicecandidate = event => {
+      if (event.candidate) sendCallSignal({ type: "ice", candidate: event.candidate });
+    };
+    peerConnection.ontrack = event => {
+      el("remoteVideo").srcObject = event.streams[0];
+      el("callStatus").textContent = "Connected";
+    };
+    peerConnection.onconnectionstatechange = () => {
+      if (peerConnection && ["failed", "disconnected"].includes(peerConnection.connectionState)) {
+        el("callStatus").textContent = "Connection interrupted";
+      }
+    };
+    localCallStream = await navigator.mediaDevices.getUserMedia({
+      audio: true, video: callMode === "video"
+    });
+    localCallStream.getTracks().forEach(track => peerConnection.addTrack(track, localCallStream));
+    el("localVideo").srcObject = localCallStream;
+    el("callVideos").classList.toggle("audio-only", callMode === "audio");
+  }
+  async function startCall(mode) {
+    if (!activeConversation || activeConversation.type !== "private" || !otherMember()) {
+      showNotice("Voice and video calls are available in one-to-one chats only."); return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) {
+      showNotice("Calls require a modern browser and HTTPS (or localhost)."); return;
+    }
+    callMode = mode; callConversationId = activeConversation.id;
+    try {
+      await preparePeerConnection();
+      showCallModal(mode === "video" ? "Video call" : "Voice call", "Calling…");
+      el("endCallButton").hidden = false;
+      socket.emit("call_invite", { conversation_id: callConversationId, mode });
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      sendCallSignal({ type: "offer", sdp: peerConnection.localDescription, mode });
+    } catch (error) { await cleanupCall(false); showNotice(`Could not start call: ${error.message}`); }
+  }
+  async function acceptCall() {
+    try {
+      callMode = pendingOffer?.mode || "audio";
+      callConversationId = pendingOffer.conversation_id;
+      await preparePeerConnection();
+      await peerConnection.setRemoteDescription(pendingOffer.offer);
+      for (const candidate of pendingIceCandidates.splice(0)) {
+        try { await peerConnection.addIceCandidate(candidate); } catch (error) { console.warn(error); }
+      }
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+      sendCallSignal({ type: "answer", sdp: peerConnection.localDescription });
+      socket.emit("call_response", { conversation_id: callConversationId, accepted: true });
+      el("acceptCallButton").hidden = true; el("declineCallButton").hidden = true;
+      el("endCallButton").hidden = false;
+      el("callStatus").textContent = "Connecting…";
+      pendingOffer = null;
+    } catch (error) { await cleanupCall(true); showNotice(`Could not accept call: ${error.message}`); }
+  }
+  async function cleanupCall(notify = true) {
+    if (notify && callConversationId && socket.connected) socket.emit("call_end", { conversation_id: callConversationId });
+    if (peerConnection) { peerConnection.ontrack = null; peerConnection.close(); peerConnection = null; }
+    if (localCallStream) { localCallStream.getTracks().forEach(track => track.stop()); localCallStream = null; }
+    el("localVideo").srcObject = null; el("remoteVideo").srcObject = null;
+    pendingOffer = null; pendingIceCandidates = []; callMode = null; callConversationId = null;
+    el("acceptCallButton").hidden = true; el("declineCallButton").hidden = true; el("endCallButton").hidden = true;
+    closeCallModal();
+  }
 
   ["😀","😃","😄","😁","😂","🤣","🥹","😊","😍","🥰","😘","😎","🤔","😭",
    "😡","👍","👎","👏","🙏","❤️","💔","🔥","🎉","✨","💯","🤝","👀","🥳",
@@ -318,7 +432,15 @@
       bubble.appendChild(author);
     }
 
-    if (message.message_type === "voice" && message.media_url) {
+    if (message.message_type === "image" && message.media_url) {
+      const image = document.createElement("img");
+      image.className = "chat-image";
+      image.src = message.media_url;
+      image.alt = "Shared image";
+      image.loading = "lazy";
+      image.addEventListener("click", () => window.open(message.media_url, "_blank", "noopener"));
+      bubble.appendChild(image);
+    } else if (message.message_type === "voice" && message.media_url) {
       const audio = document.createElement("audio");
       audio.className = "voice-audio";
       audio.controls = true;
@@ -386,7 +508,10 @@
     messageInput.disabled = false;
     sendButton.disabled = !socket.connected;
     emojiButton.disabled = false;
+    imageButton.disabled = false;
     voiceButton.disabled = !socket.connected;
+    el("audioCallButton").disabled = !socket.connected || conversation.type !== "private";
+    el("videoCallButton").disabled = !socket.connected || conversation.type !== "private";
     messageInput.placeholder = "Type a message";
     renderConversationList();
     messagesElement.replaceChildren();
@@ -440,6 +565,44 @@
       conversation_id: activeConversation.id, is_typing: false
     });
     messageInput.focus();
+  });
+
+  imageButton.addEventListener("click", () => {
+    if (activeConversation) imageInput.click();
+  });
+
+  imageInput.addEventListener("change", async () => {
+    const file = imageInput.files?.[0];
+    if (!file || !activeConversation || !socket.connected) return;
+    if (!file.type.startsWith("image/")) {
+      voiceStatus.textContent = "Please choose an image file.";
+      imageInput.value = "";
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      voiceStatus.textContent = "Images must be 8 MB or smaller.";
+      imageInput.value = "";
+      return;
+    }
+    const conversationId = activeConversation.id;
+    imageButton.disabled = true;
+    voiceStatus.textContent = "Uploading image…";
+    try {
+      const form = new FormData();
+      form.append("image", file, file.name);
+      form.append("conversation_id", String(conversationId));
+      const response = await fetch("/api/image-upload", {method:"POST", body:form});
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Image upload failed.");
+      if (!socket.connected) throw new Error("Connection lost before the image could be sent.");
+      socket.emit("image_message", {conversation_id: conversationId, media_url: result.media_url});
+      voiceStatus.textContent = "Image sent.";
+    } catch (error) {
+      voiceStatus.textContent = error.message;
+    } finally {
+      imageInput.value = "";
+      imageButton.disabled = !activeConversation || !socket.connected;
+    }
   });
 
   messageInput.addEventListener("input", () => {
@@ -521,7 +684,10 @@
     statusElement.textContent = activeConversation ? "Connected" : "Online";
     sendButton.disabled = !activeConversation;
     emojiButton.disabled = !activeConversation;
+    imageButton.disabled = !activeConversation;
     voiceButton.disabled = !activeConversation;
+    el("audioCallButton").disabled = !activeConversation || activeConversation.type !== "private";
+    el("videoCallButton").disabled = !activeConversation || activeConversation.type !== "private";
     socket.emit("get_presence");
     if (activeConversation) {
       socket.emit("join_conversation", { conversation_id: activeConversation.id });
@@ -531,7 +697,9 @@
   socket.on("disconnect", () => {
     statusElement.textContent = "Reconnecting…";
     sendButton.disabled = true;
+    imageButton.disabled = true;
     voiceButton.disabled = true;
+    el("audioCallButton").disabled = true; el("videoCallButton").disabled = true;
   });
 
   socket.on("connect_error", error => {
@@ -583,6 +751,61 @@
     typingIndicator.textContent = currentlyTyping.size
       ? `${Array.from(currentlyTyping).join(", ")} typing…` : "";
   });
+
+  socket.on("call_ringing", () => { el("callStatus").textContent = "Ringing…"; });
+  socket.on("call_error", data => { showNotice(data?.message || "Call could not be started."); cleanupCall(false); });
+  socket.on("incoming_call", data => {
+    if (callConversationId) {
+      socket.emit("call_response", { conversation_id: data.conversation_id, accepted: false });
+      return;
+    }
+    pendingOffer = { ...data };
+    callConversationId = data.conversation_id;
+    callMode = data.mode;
+    showCallModal(`${data.mode === "video" ? "Video" : "Voice"} call from ${data.caller_name}`, "Incoming call…");
+    el("acceptCallButton").hidden = true; el("declineCallButton").hidden = false;
+  });
+  socket.on("call_response", data => {
+    if (data.conversation_id !== callConversationId) return;
+    if (!data.accepted) { el("callStatus").textContent = "Call declined"; setTimeout(() => cleanupCall(false), 1200); }
+    else if (peerConnection && peerConnection.signalingState === "have-local-offer") {
+      // The callee will send the SDP answer through call_signal.
+      el("callStatus").textContent = "Connecting…";
+    }
+  });
+  socket.on("call_signal", async data => {
+    if (!callConversationId || data.conversation_id !== callConversationId) return;
+    const signal = data.signal || {};
+    try {
+      if (signal.type === "offer") {
+        if (!peerConnection && pendingOffer) {
+          pendingOffer.offer = signal.sdp;
+          pendingOffer.mode = signal.mode || pendingOffer.mode || "audio";
+          el("acceptCallButton").hidden = false;
+          el("callStatus").textContent = "Incoming call…";
+        }
+      } else if (signal.type === "answer" && peerConnection) {
+        await peerConnection.setRemoteDescription(signal.sdp);
+        for (const candidate of pendingIceCandidates.splice(0)) {
+          try { await peerConnection.addIceCandidate(candidate); } catch (error) { console.warn(error); }
+        }
+      } else if (signal.type === "ice" && signal.candidate) {
+        if (peerConnection?.remoteDescription) await peerConnection.addIceCandidate(signal.candidate);
+        else pendingIceCandidates.push(signal.candidate);
+      }
+    } catch (error) { console.error("Call signaling error", error); }
+  });
+  socket.on("call_ended", data => {
+    if (data.conversation_id === callConversationId) { el("callStatus").textContent = "Call ended"; cleanupCall(false); }
+  });
+  el("audioCallButton").addEventListener("click", () => startCall("audio"));
+  el("videoCallButton").addEventListener("click", () => startCall("video"));
+  el("acceptCallButton").addEventListener("click", acceptCall);
+  el("declineCallButton").addEventListener("click", () => {
+    if (callConversationId) socket.emit("call_response", { conversation_id: callConversationId, accepted: false });
+    cleanupCall(false);
+  });
+  el("endCallButton").addEventListener("click", () => cleanupCall(true));
 
   socket.on("chat_error", data => showNotice(data?.msg || "A chat error occurred."));
 
