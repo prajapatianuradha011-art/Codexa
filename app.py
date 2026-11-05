@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import uuid
+from pathlib import Path
 from collections import defaultdict
 
 from flask import Flask, render_template, request, redirect, session, url_for, jsonify
@@ -12,6 +14,10 @@ socketio = SocketIO(app, cors_allowed_origins=None)
 
 DATABASE = os.path.join(app.root_path, "chat.db")
 MAX_MESSAGE_LENGTH = 2000
+MAX_VOICE_BYTES = 8 * 1024 * 1024
+VOICE_FOLDER = os.path.join(app.root_path, "static", "voice_uploads")
+os.makedirs(VOICE_FOLDER, exist_ok=True)
+ALLOWED_AUDIO_EXTENSIONS = {".webm", ".ogg", ".mp4", ".m4a", ".wav"}
 
 # Tracks active Socket.IO connections per authenticated user.
 online_sockets = defaultdict(set)
@@ -52,6 +58,9 @@ def init_db():
             "receiver_id": "INTEGER",
             "conversation_id": "INTEGER",
             "is_read": "INTEGER NOT NULL DEFAULT 0",
+            "message_type": "TEXT NOT NULL DEFAULT 'text'",
+            "media_url": "TEXT",
+            "duration": "REAL",
         }
         for column, definition in additions.items():
             if column not in message_columns:
@@ -301,7 +310,7 @@ def api_messages(conversation_id):
 
         rows = conn.execute("""
             SELECT id, conversation_id, username AS sender,
-                   msg AS body, created_at
+                   msg AS body, created_at, message_type, media_url, duration
             FROM messages
             WHERE conversation_id = ?
             ORDER BY id ASC
@@ -448,6 +457,82 @@ def handle_chat_message(data):
         emit("chat_error", {"msg": "Message could not be saved. Please try again."})
 
 
+@app.route("/api/voice-upload", methods=["POST"])
+def upload_voice_message():
+    user = get_logged_in_user()
+    if not user:
+        return jsonify({"error": "Login required"}), 401
+    audio = request.files.get("audio")
+    if not audio or not audio.filename:
+        return jsonify({"error": "No audio file was uploaded."}), 400
+    extension = Path(audio.filename).suffix.lower()
+    if extension not in ALLOWED_AUDIO_EXTENSIONS:
+        return jsonify({"error": "Unsupported audio format."}), 400
+    content = audio.stream.read(MAX_VOICE_BYTES + 1)
+    if not content:
+        return jsonify({"error": "The voice recording is empty."}), 400
+    if len(content) > MAX_VOICE_BYTES:
+        return jsonify({"error": "Voice messages must be 8 MB or smaller."}), 413
+    filename = f"{uuid.uuid4().hex}{extension}"
+    with open(os.path.join(VOICE_FOLDER, filename), "wb") as output:
+        output.write(content)
+    return jsonify({"media_url": url_for("static", filename=f"voice_uploads/{filename}")})
+
+
+@socketio.on("voice_message")
+def handle_voice_message(data):
+    uid = socket_users.get(request.sid)
+    if uid is None or not isinstance(data, dict):
+        emit("chat_error", {"msg": "Please log in again."})
+        return
+    cid, media_url = data.get("conversation_id"), data.get("media_url")
+    try:
+        duration = max(0, min(float(data.get("duration", 0)), 600))
+    except (TypeError, ValueError):
+        duration = 0
+    if not isinstance(cid, int) or not isinstance(media_url, str):
+        emit("chat_error", {"msg": "Invalid voice message."})
+        return
+    if not media_url.startswith("/static/voice_uploads/") or ".." in media_url:
+        emit("chat_error", {"msg": "Invalid audio location."})
+        return
+    try:
+        with get_db() as conn:
+            if not is_member(conn, cid, uid):
+                emit("chat_error", {"msg": "You are not a member of this conversation."})
+                return
+            members = conn.execute("""
+                SELECT u.id, u.username FROM conversation_members cm
+                JOIN users u ON u.id = cm.user_id WHERE cm.conversation_id = ?
+            """, (cid,)).fetchall()
+            sender = next((m for m in members if m["id"] == uid), None)
+            others = [m for m in members if m["id"] != uid]
+            if not sender or not others:
+                emit("chat_error", {"msg": "Invalid conversation."})
+                return
+            kind = conn.execute("SELECT type FROM conversations WHERE id = ?", (cid,)).fetchone()["type"]
+            receiver_id = others[0]["id"] if kind == "private" else None
+            cur = conn.execute("""
+                INSERT INTO messages
+                (username, msg, sender_id, receiver_id, conversation_id,
+                 is_read, message_type, media_url, duration)
+                VALUES (?, 'Voice message', ?, ?, ?, 0, 'voice', ?, ?)
+            """, (sender["username"], uid, receiver_id, cid, media_url, duration))
+            mid = cur.lastrowid
+            created = conn.execute("SELECT created_at FROM messages WHERE id = ?", (mid,)).fetchone()["created_at"]
+        payload = {
+            "id": mid, "conversation_id": cid, "sender": sender["username"],
+            "body": "Voice message", "created_at": created, "message_type": "voice",
+            "media_url": media_url, "duration": duration
+        }
+        for member in others:
+            socketio.emit("new_message", payload, room=f"user:{member['id']}")
+        emit("message_sent", payload)
+    except sqlite3.Error:
+        app.logger.exception("Could not save voice message")
+        emit("chat_error", {"msg": "Voice message could not be saved."})
+
+
 @socketio.on("typing")
 def handle_typing(data):
     uid = socket_users.get(request.sid)
@@ -477,3 +562,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
+
