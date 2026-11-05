@@ -66,6 +66,8 @@
     <form class="composer" id="messageForm">
       <button class="composer-tool" id="imageButton" type="button" title="Send image" disabled>📷</button>
       <input id="imageInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
+      <button class="composer-tool" id="videoButton" type="button" title="Send video" disabled>🎬</button>
+      <input id="videoInput" type="file" accept="video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov" hidden>
       <button class="composer-tool" id="emojiButton" type="button" title="Add emoji" disabled>😊</button>
       <input id="messageInput" type="text" placeholder="Select a conversation first"
              maxlength="2000" autocomplete="off" disabled required>
@@ -138,6 +140,8 @@
   const emojiButton = el("emojiButton");
   const imageButton = el("imageButton");
   const imageInput = el("imageInput");
+  const videoButton = el("videoButton");
+  const videoInput = el("videoInput");
   const emojiPicker = el("emojiPicker");
   const voiceButton = el("voiceButton");
   const voiceStatus = el("voiceStatus");
@@ -423,6 +427,7 @@
 
     const bubble = document.createElement("div");
     bubble.className = "message";
+    bubble.dataset.messageId = message.id || "";
     if (message.sender === currentUsername) {
       bubble.classList.add("mine");
     } else {
@@ -440,6 +445,14 @@
       image.loading = "lazy";
       image.addEventListener("click", () => window.open(message.media_url, "_blank", "noopener"));
       bubble.appendChild(image);
+    } else if (message.message_type === "video" && message.media_url) {
+      const video = document.createElement("video");
+      video.className = "chat-video";
+      video.controls = true;
+      video.preload = "metadata";
+      video.playsInline = true;
+      video.src = message.media_url;
+      bubble.appendChild(video);
     } else if (message.message_type === "voice" && message.media_url) {
       const audio = document.createElement("audio");
       audio.className = "voice-audio";
@@ -455,6 +468,7 @@
       const body = document.createElement("div");
       body.className = "message-text";
       body.textContent = message.body || "";
+      if (message.message_type === "deleted") body.classList.add("message-deleted");
       bubble.appendChild(body);
     }
 
@@ -466,7 +480,43 @@
       : new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
     meta.appendChild(time);
+    if (message.edited && message.message_type !== "deleted") {
+      const edited = document.createElement("span");
+      edited.className = "edited-label";
+      edited.textContent = "edited";
+      meta.appendChild(edited);
+    }
     bubble.appendChild(meta);
+
+    if (message.sender === currentUsername && message.message_type !== "deleted" && message.id) {
+      const actions = document.createElement("div");
+      actions.className = "message-actions";
+      if (message.message_type === "text") {
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.textContent = "Edit";
+        edit.title = "Edit message";
+        edit.addEventListener("click", () => {
+          const revised = prompt("Edit your message:", message.body || "");
+          if (revised === null) return;
+          const clean = revised.trim();
+          if (!clean || clean === message.body) return;
+          socket.emit("edit_message", { message_id: message.id, body: clean });
+        });
+        actions.appendChild(edit);
+      }
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Delete";
+      remove.title = "Delete message";
+      remove.addEventListener("click", () => {
+        if (confirm("Delete this message for everyone in this conversation?")) {
+          socket.emit("delete_message", { message_id: message.id });
+        }
+      });
+      actions.appendChild(remove);
+      bubble.appendChild(actions);
+    }
     messagesElement.appendChild(bubble);
     scrollToBottom();
 
@@ -509,6 +559,7 @@
     sendButton.disabled = !socket.connected;
     emojiButton.disabled = false;
     imageButton.disabled = false;
+    videoButton.disabled = !socket.connected;
     voiceButton.disabled = !socket.connected;
     el("audioCallButton").disabled = !socket.connected || conversation.type !== "private";
     el("videoCallButton").disabled = !socket.connected || conversation.type !== "private";
@@ -605,6 +656,46 @@
     }
   });
 
+  videoButton.addEventListener("click", () => {
+    if (activeConversation) videoInput.click();
+  });
+
+  videoInput.addEventListener("change", async () => {
+    const file = videoInput.files?.[0];
+    if (!file || !activeConversation || !socket.connected) return;
+    const allowed = ["video/mp4", "video/webm", "video/quicktime"];
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    if (!allowed.includes(file.type) && !["mp4", "webm", "mov"].includes(extension)) {
+      voiceStatus.textContent = "Please choose an MP4, WEBM or MOV video.";
+      videoInput.value = "";
+      return;
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      voiceStatus.textContent = "Videos must be 50 MB or smaller.";
+      videoInput.value = "";
+      return;
+    }
+    const conversationId = activeConversation.id;
+    videoButton.disabled = true;
+    voiceStatus.textContent = "Uploading video…";
+    try {
+      const form = new FormData();
+      form.append("video", file, file.name);
+      form.append("conversation_id", String(conversationId));
+      const response = await fetch("/api/video-upload", {method:"POST", body:form});
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Video upload failed.");
+      if (!socket.connected) throw new Error("Connection lost before the video could be sent.");
+      socket.emit("video_message", {conversation_id: conversationId, media_url: result.media_url});
+      voiceStatus.textContent = "Video sent.";
+    } catch (error) {
+      voiceStatus.textContent = error.message;
+    } finally {
+      videoInput.value = "";
+      videoButton.disabled = !activeConversation || !socket.connected;
+    }
+  });
+
   messageInput.addEventListener("input", () => {
     if (!activeConversation || !socket.connected) return;
     socket.emit("typing", {
@@ -685,6 +776,7 @@
     sendButton.disabled = !activeConversation;
     emojiButton.disabled = !activeConversation;
     imageButton.disabled = !activeConversation;
+    videoButton.disabled = !activeConversation;
     voiceButton.disabled = !activeConversation;
     el("audioCallButton").disabled = !activeConversation || activeConversation.type !== "private";
     el("videoCallButton").disabled = !activeConversation || activeConversation.type !== "private";
@@ -698,6 +790,7 @@
     statusElement.textContent = "Reconnecting…";
     sendButton.disabled = true;
     imageButton.disabled = true;
+    videoButton.disabled = true;
     voiceButton.disabled = true;
     el("audioCallButton").disabled = true; el("videoCallButton").disabled = true;
   });
@@ -724,6 +817,19 @@
   socket.on("message_sent", data => {
     addMessage(data);
   });
+
+  function refreshMessage(data) {
+    if (data.conversation_id !== activeConversation?.id) {
+      loadConversations().catch(console.error);
+      return;
+    }
+    const oldBubble = messagesElement.querySelector(`[data-message-id="${data.id}"]`);
+    if (oldBubble) oldBubble.remove();
+    renderedMessageIds.delete(data.id);
+    addMessage(data);
+  }
+  socket.on("message_updated", refreshMessage);
+  socket.on("message_deleted", refreshMessage);
 
   socket.on("presence_update", data => {
     const users = data?.online_users || [];
