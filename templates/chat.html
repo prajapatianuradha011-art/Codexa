@@ -1,6 +1,5 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,487 +7,613 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
-
 <body>
-  <div class="app">
-    <aside class="sidebar">
-      <div class="sidebar-header">
-        <div class="profile">
-          <div class="avatar">{{ username[0]|upper }}</div>
-          <div class="profile-name">{{ username }}</div>
-        </div>
-        <form action="/logout" method="POST">
-          <button class="icon-button" type="submit" title="Logout">↪</button>
-        </form>
-      </div>
-
-      <div class="sidebar-actions">
-        <button class="new-chat-button" id="newPrivateButton" type="button">＋ New chat</button>
-      </div>
-
-      <div class="search-area">
-        <div class="search-box">
-          <span>⌕</span>
-          <input id="searchInput" type="text" placeholder="Search conversations">
-        </div>
-      </div>
-
-      <div class="chat-list" id="chatList">
-        <div class="empty-note">Loading conversations…</div>
-      </div>
-
-      <div class="online-panel">
-        <h3>Online now</h3>
-        <ul id="onlineUsers">
-          <li>Connecting…</li>
-        </ul>
-      </div>
-    </aside>
-
-    <main class="conversation">
-      <header class="conversation-header">
-        <div class="header-info">
-          <div class="avatar" id="conversationAvatar"></div>
-          <div>
-            <div class="header-title" id="conversationTitle">Select a conversation</div>
-            <div class="header-status" id="status">Connecting…</div>
-          </div>
-        </div>
-      </header>
-
-      <section class="messages" id="messages" aria-live="polite">
-        <div class="day-label">Your conversations</div>
-        <div class="empty-note">Choose a chat or start a new conversation.</div>
-      </section>
-
-      <div class="typing-indicator" id="typingIndicator" aria-live="polite"></div>
-
-      <form class="composer" id="messageForm">
-        <button class="composer-tool" id="emojiButton" type="button" title="Add emoji" disabled>😊</button>
-        <input id="messageInput" type="text" placeholder="Select a conversation first" maxlength="2000"
-          autocomplete="off" disabled required>
-        <button class="composer-tool" id="voiceButton" type="button" title="Record voice message" disabled>🎙️</button>
-        <button class="send-button" id="sendButton" type="submit" title="Send message" disabled>➤</button>
-        <div class="emoji-picker" id="emojiPicker" hidden></div>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <button class="profile profile-trigger" id="myProfileButton" type="button" title="View or edit your profile">
+        <div class="avatar" id="myAvatar">{{ username[0]|upper }}</div>
+        <div class="profile-name" id="myDisplayName">{{ username }}</div>
+      </button>
+      <form action="/logout" method="POST">
+        <button class="icon-button" type="submit" title="Logout">↪</button>
       </form>
-      <div class="voice-status" id="voiceStatus" aria-live="polite"></div>
-    </main>
-  </div>
+    </div>
 
-  <script>
-    (() => {
-      const currentUsername = {{ username | tojson
-    }};
-    const socket = io();
-    const el = id => document.getElementById(id);
+    <div class="sidebar-actions">
+      <button class="new-chat-button" id="newPrivateButton" type="button">＋ New chat</button>
+    </div>
 
-    const chatList = el("chatList");
-    const messagesElement = el("messages");
-    const messageForm = el("messageForm");
-    const messageInput = el("messageInput");
-    const sendButton = el("sendButton");
-    const statusElement = el("status");
-    const searchInput = el("searchInput");
-    const onlineUsersElement = el("onlineUsers");
-    const typingIndicator = el("typingIndicator");
-    const emojiButton = el("emojiButton");
-    const emojiPicker = el("emojiPicker");
-    const voiceButton = el("voiceButton");
-    const voiceStatus = el("voiceStatus");
+    <div class="search-area">
+      <div class="search-box">
+        <span>⌕</span>
+        <input id="searchInput" type="text" placeholder="Search conversations">
+      </div>
+    </div>
 
-    ["😀", "😃", "😄", "😁", "😂", "🤣", "🥹", "😊", "😍", "🥰", "😘", "😎", "🤔", "😭",
-      "😡", "👍", "👎", "👏", "🙏", "❤️", "💔", "🔥", "🎉", "✨", "💯", "🤝", "👀", "🥳",
-      "🤩", "💪", "☕", "🍕", "😴", "🤗", "🙃", "😇"].forEach(emoji => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "emoji-option";
-        button.textContent = emoji;
-        button.addEventListener("click", () => {
-          const start = messageInput.selectionStart ?? messageInput.value.length;
-          const end = messageInput.selectionEnd ?? start;
-          messageInput.value = messageInput.value.slice(0, start) + emoji + messageInput.value.slice(end);
-          messageInput.focus();
-          messageInput.setSelectionRange(start + emoji.length, start + emoji.length);
-          emojiPicker.hidden = true;
-        });
-        emojiPicker.appendChild(button);
-      });
-    emojiButton.addEventListener("click", () => emojiPicker.hidden = !emojiPicker.hidden);
+    <div class="chat-list" id="chatList">
+      <div class="empty-note">Loading conversations…</div>
+    </div>
 
-    let conversations = [];
-    let activeConversation = null;
-    let typingTimer = null;
-    let currentlyTyping = new Set();
-    const renderedMessageIds = new Set();
+    <div class="online-panel">
+      <h3>Online now</h3>
+      <ul id="onlineUsers"><li>Connecting…</li></ul>
+    </div>
+  </aside>
 
-    async function api(url, options = {}) {
-      const response = await fetch(url, {
-        ...options,
-        headers: { "Content-Type": "application/json", ...(options.headers || {}) }
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
-      return result;
-    }
+  <main class="conversation">
+    <header class="conversation-header">
+      <div class="header-info">
+        <button class="avatar profile-avatar-trigger" id="conversationAvatar" type="button" aria-label="View profile"></button>
+        <div>
+          <button class="header-title profile-title-trigger" id="conversationTitle" type="button">Select a conversation</button>
+          <div class="header-status" id="status">Connecting…</div>
+        </div>
+      </div>
+    </header>
 
-    function conversationName(conversation) {
-      const other = conversation.members.find(member => member.username !== currentUsername);
-      return other ? other.username : "Private chat";
-    }
+    <section class="messages" id="messages" aria-live="polite">
+      <div class="day-label">Your conversations</div>
+      <div class="empty-note">Choose a chat or start a new conversation.</div>
+    </section>
 
-    function renderConversationList() {
-      const query = searchInput.value.trim().toLowerCase();
-      chatList.replaceChildren();
-      const filtered = conversations.filter(c => conversationName(c).toLowerCase().includes(query));
+    <div class="typing-indicator" id="typingIndicator" aria-live="polite"></div>
 
-      if (!filtered.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty-note";
-        empty.textContent = query ? "No matching conversations." : "No chats yet. Start a new chat!";
-        chatList.appendChild(empty);
-        return;
-      }
+    <form class="composer" id="messageForm">
+      <button class="composer-tool" id="emojiButton" type="button" title="Add emoji" disabled>😊</button>
+      <input id="messageInput" type="text" placeholder="Select a conversation first"
+             maxlength="2000" autocomplete="off" disabled required>
+      <button class="composer-tool" id="voiceButton" type="button" title="Record voice message" disabled>🎙️</button>
+      <button class="send-button" id="sendButton" type="submit" title="Send message" disabled>➤</button>
+      <div class="emoji-picker" id="emojiPicker" hidden></div>
+    </form>
+    <div class="voice-status" id="voiceStatus" aria-live="polite"></div>
+  </main>
+</div>
 
-      filtered.forEach(conversation => {
-        const item = document.createElement("button");
-        item.type = "button";
-        item.className = "chat-item" + (activeConversation?.id === conversation.id ? " active" : "");
-        item.addEventListener("click", () => openConversation(conversation));
+<div class="profile-modal-backdrop" id="profileModal" hidden>
+  <section class="profile-modal" role="dialog" aria-modal="true" aria-labelledby="profileModalTitle">
+    <button class="profile-modal-close" id="closeProfileModal" type="button" aria-label="Close">×</button>
+    <div class="profile-modal-avatar" id="profileModalAvatar">?</div>
+    <h2 id="profileModalTitle">Profile</h2>
+    <div class="profile-presence" id="profilePresence"></div>
+    <div class="profile-view" id="profileView">
+      <div class="profile-field"><span>Username</span><strong id="profileUsername"></strong></div>
+      <div class="profile-field"><span>Display name</span><strong id="profileDisplayName"></strong></div>
+      <div class="profile-field"><span>About</span><p id="profileBio"></p></div>
+      <div class="profile-field"><span>Last seen</span><strong id="profileLastSeen"></strong></div>
+      <button class="new-chat-button" id="editProfileButton" type="button" hidden>Edit profile</button>
+    </div>
+    <form class="profile-edit" id="profileEdit" hidden>
+      <label>Display name<input id="editDisplayName" maxlength="40" required></label>
+      <label>About / bio<textarea id="editBio" maxlength="160" rows="3" placeholder="A little about you"></textarea></label>
+      <label>Profile photo<input id="editAvatar" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></label>
+      <p class="profile-edit-hint">Image up to 3 MB. PNG, JPG, WEBP or GIF.</p>
+      <div class="profile-edit-actions">
+        <button class="new-chat-button secondary" id="cancelProfileEdit" type="button">Cancel</button>
+        <button class="new-chat-button" type="submit">Save changes</button>
+      </div>
+    </form>
+  </section>
+</div>
 
-        const avatar = document.createElement("div");
-        avatar.className = "avatar";
-        avatar.textContent = conversationName(conversation).slice(0, 1).toUpperCase();
+<script>
+(() => {
+  const currentUsername = {{ username | tojson }};
+  const socket = io();
+  const el = id => document.getElementById(id);
 
-        const details = document.createElement("div");
-        details.className = "chat-details";
-        const titleRow = document.createElement("div");
-        titleRow.className = "chat-title-row";
+  const chatList = el("chatList");
+  const messagesElement = el("messages");
+  const messageForm = el("messageForm");
+  const messageInput = el("messageInput");
+  const sendButton = el("sendButton");
+  const statusElement = el("status");
+  const searchInput = el("searchInput");
+  const onlineUsersElement = el("onlineUsers");
+  const typingIndicator = el("typingIndicator");
+  const emojiButton = el("emojiButton");
+  const emojiPicker = el("emojiPicker");
+  const voiceButton = el("voiceButton");
+  const voiceStatus = el("voiceStatus");
+  const profileModal = el("profileModal");
+  let myProfile = null;
+  let viewedProfile = null;
 
-        const title = document.createElement("span");
-        title.className = "chat-title";
-        title.textContent = conversationName(conversation);
-
-        const time = document.createElement("span");
-        time.className = "chat-time";
-        const last = conversation.last_message;
-        time.textContent = last ? new Date(last.created_at + "Z").toLocaleTimeString([], {
-          hour: "2-digit", minute: "2-digit"
-        }) : "";
-
-        const preview = document.createElement("div");
-        preview.className = "chat-preview";
-        preview.textContent = last
-          ? `${last.sender === currentUsername ? "You" : last.sender}: ${last.body}`
-          : "Start chatting";
-
-        titleRow.append(title, time);
-        details.append(titleRow, preview);
-        item.append(avatar, details);
-        chatList.appendChild(item);
-      });
-    }
-
-    function scrollToBottom() {
-      messagesElement.scrollTop = messagesElement.scrollHeight;
-    }
-
-    function addMessage(message) {
-      if (!message || message.conversation_id !== activeConversation?.id) return;
-      if (message.id && renderedMessageIds.has(message.id)) return;
-      if (message.id) renderedMessageIds.add(message.id);
-
-      const bubble = document.createElement("div");
-      bubble.className = "message";
-      if (message.sender === currentUsername) {
-        bubble.classList.add("mine");
-      } else {
-        const author = document.createElement("div");
-        author.className = "message-author";
-        author.textContent = message.sender || "Unknown";
-        bubble.appendChild(author);
-      }
-
-      if (message.message_type === "voice" && message.media_url) {
-        const audio = document.createElement("audio");
-        audio.className = "voice-audio";
-        audio.controls = true;
-        audio.preload = "metadata";
-        audio.src = message.media_url;
-        bubble.appendChild(audio);
-        const label = document.createElement("div");
-        label.className = "voice-label";
-        label.textContent = `🎙️ Voice message${message.duration ? " · " + Math.round(message.duration) + "s" : ""}`;
-        bubble.appendChild(label);
-      } else {
-        const body = document.createElement("div");
-        body.className = "message-text";
-        body.textContent = message.body || "";
-        bubble.appendChild(body);
-      }
-
-      const meta = document.createElement("div");
-      meta.className = "message-meta";
-      const time = document.createElement("span");
-      time.textContent = message.created_at
-        ? new Date(message.created_at + "Z").toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-        : new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
-      meta.appendChild(time);
-      bubble.appendChild(meta);
-      messagesElement.appendChild(bubble);
-      scrollToBottom();
-
-      const conversation = conversations.find(c => c.id === message.conversation_id);
-      if (conversation) {
-        conversation.last_message = {
-          sender: message.sender, body: message.body, created_at: message.created_at
-        };
-        conversations.sort((a, b) =>
-          ((b.last_message || {}).created_at || "").localeCompare((a.last_message || {}).created_at || "")
-        );
-        renderConversationList();
-      }
-    }
-
-    async function loadConversations() {
-      const result = await api("/api/conversations");
-      conversations = result.conversations || [];
-      renderConversationList();
-      if (!activeConversation && conversations.length) await openConversation(conversations[0]);
-    }
-
-    async function openConversation(conversation) {
-      if (activeConversation && socket.connected) {
-        socket.emit("leave_conversation", { conversation_id: activeConversation.id });
-      }
-
-      activeConversation = conversation;
-      currentlyTyping.clear();
-      typingIndicator.textContent = "";
+  ["😀","😃","😄","😁","😂","🤣","🥹","😊","😍","🥰","😘","😎","🤔","😭",
+   "😡","👍","👎","👏","🙏","❤️","💔","🔥","🎉","✨","💯","🤝","👀","🥳",
+   "🤩","💪","☕","🍕","😴","🤗","🙃","😇"].forEach(emoji => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "emoji-option";
+    button.textContent = emoji;
+    button.addEventListener("click", () => {
+      const start = messageInput.selectionStart ?? messageInput.value.length;
+      const end = messageInput.selectionEnd ?? start;
+      messageInput.value = messageInput.value.slice(0,start) + emoji + messageInput.value.slice(end);
+      messageInput.focus();
+      messageInput.setSelectionRange(start + emoji.length, start + emoji.length);
       emojiPicker.hidden = true;
-      voiceStatus.textContent = "";
-      renderedMessageIds.clear();
+    });
+    emojiPicker.appendChild(button);
+  });
+  emojiButton.addEventListener("click", () => emojiPicker.hidden = !emojiPicker.hidden);
 
-      const name = conversationName(conversation);
-      el("conversationTitle").textContent = name;
-      el("conversationAvatar").textContent = name.slice(0, 1).toUpperCase();
-      statusElement.textContent = "Private conversation";
+  let conversations = [];
+  let activeConversation = null;
+  let typingTimer = null;
+  let currentlyTyping = new Set();
+  const renderedMessageIds = new Set();
 
-      messageInput.disabled = false;
-      sendButton.disabled = !socket.connected;
-      emojiButton.disabled = false;
-      voiceButton.disabled = !socket.connected;
-      messageInput.placeholder = "Type a message";
+  async function api(url, options = {}) {
+    const response = await fetch(url, {
+      ...options,
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
+    return result;
+  }
+
+  function setAvatar(element, profile, fallbackName = "?") {
+    element.replaceChildren();
+    if (profile?.avatar_url) {
+      const img = document.createElement("img");
+      img.src = profile.avatar_url;
+      img.alt = "";
+      element.appendChild(img);
+    } else {
+      element.textContent = (profile?.display_name || profile?.username || fallbackName).slice(0, 1).toUpperCase();
+    }
+  }
+
+  function formatLastSeen(value) {
+    if (!value) return "Not available";
+    const date = new Date(value.replace(" ", "T") + (value.endsWith("Z") ? "" : "Z"));
+    return Number.isNaN(date.getTime()) ? "Not available" : date.toLocaleString();
+  }
+
+  async function openProfile(userId, isMine = false) {
+    try {
+      const result = isMine ? await api("/api/profile") : await api(`/api/users/${userId}/profile`);
+      viewedProfile = result.profile;
+      const profile = viewedProfile;
+      setAvatar(el("profileModalAvatar"), profile);
+      el("profileModalTitle").textContent = profile.display_name || profile.username;
+      el("profilePresence").textContent = profile.is_online ? "● Online" : "○ Offline";
+      el("profilePresence").className = "profile-presence " + (profile.is_online ? "online" : "offline");
+      el("profileUsername").textContent = "@" + profile.username;
+      el("profileDisplayName").textContent = profile.display_name || profile.username;
+      el("profileBio").textContent = profile.bio || "No bio added yet.";
+      el("profileLastSeen").textContent = profile.is_online ? "Online now" : formatLastSeen(profile.last_seen);
+      el("editProfileButton").hidden = !isMine;
+      el("profileView").hidden = false;
+      el("profileEdit").hidden = true;
+      profileModal.hidden = false;
+    } catch (error) { alert(error.message); }
+  }
+
+  function beginProfileEdit() {
+    if (!viewedProfile) return;
+    el("editDisplayName").value = viewedProfile.display_name || viewedProfile.username;
+    el("editBio").value = viewedProfile.bio || "";
+    el("editAvatar").value = "";
+    el("profileView").hidden = true;
+    el("profileEdit").hidden = false;
+  }
+
+  async function refreshMyProfile(profile) {
+    myProfile = profile;
+    el("myDisplayName").textContent = profile.display_name || profile.username;
+    setAvatar(el("myAvatar"), profile, currentUsername);
+  }
+
+  async function saveProfile(event) {
+    event.preventDefault();
+    try {
+      const result = await api("/api/profile", { method: "PUT", body: JSON.stringify({
+        display_name: el("editDisplayName").value,
+        bio: el("editBio").value
+      }) });
+      let profile = result.profile;
+      const file = el("editAvatar").files[0];
+      if (file) {
+        const form = new FormData(); form.append("photo", file);
+        const response = await fetch("/api/profile/avatar", { method: "POST", body: form });
+        const uploaded = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(uploaded.error || "Could not upload profile photo.");
+        profile = uploaded.profile;
+      }
+      await refreshMyProfile(profile);
+      profileModal.hidden = true;
+      if (activeConversation) updateConversationHeader(activeConversation);
       renderConversationList();
-      messagesElement.replaceChildren();
+    } catch (error) { alert(error.message); }
+  }
 
+  function updateConversationHeader(conversation) {
+    const other = conversation.members.find(member => member.username !== currentUsername);
+    const name = other?.display_name || other?.username || "Private chat";
+    el("conversationTitle").textContent = name;
+    setAvatar(el("conversationAvatar"), other, name);
+    el("conversationTitle").disabled = !other;
+    el("conversationAvatar").disabled = !other;
+  }
+
+  function conversationName(conversation) {
+    const other = conversation.members.find(member => member.username !== currentUsername);
+    return other ? (other.display_name || other.username) : "Private chat";
+  }
+
+  function renderConversationList() {
+    const query = searchInput.value.trim().toLowerCase();
+    chatList.replaceChildren();
+    const filtered = conversations.filter(c => conversationName(c).toLowerCase().includes(query));
+
+    if (!filtered.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-note";
+      empty.textContent = query ? "No matching conversations." : "No chats yet. Start a new chat!";
+      chatList.appendChild(empty);
+      return;
+    }
+
+    filtered.forEach(conversation => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "chat-item" + (activeConversation?.id === conversation.id ? " active" : "");
+      item.addEventListener("click", () => openConversation(conversation));
+
+      const avatar = document.createElement("div");
+      avatar.className = "avatar";
+      const otherMember = conversation.members.find(member => member.username !== currentUsername);
+      setAvatar(avatar, otherMember, conversationName(conversation));
+
+      const details = document.createElement("div");
+      details.className = "chat-details";
+      const titleRow = document.createElement("div");
+      titleRow.className = "chat-title-row";
+
+      const title = document.createElement("span");
+      title.className = "chat-title";
+      title.textContent = conversationName(conversation);
+
+      const time = document.createElement("span");
+      time.className = "chat-time";
+      const last = conversation.last_message;
+      time.textContent = last ? new Date(last.created_at + "Z").toLocaleTimeString([], {
+        hour: "2-digit", minute: "2-digit"
+      }) : "";
+
+      const preview = document.createElement("div");
+      preview.className = "chat-preview";
+      preview.textContent = last
+        ? `${last.sender === currentUsername ? "You" : last.sender}: ${last.body}`
+        : "Start chatting";
+
+      titleRow.append(title, time);
+      details.append(titleRow, preview);
+      item.append(avatar, details);
+      chatList.appendChild(item);
+    });
+  }
+
+  function scrollToBottom() {
+    messagesElement.scrollTop = messagesElement.scrollHeight;
+  }
+
+  function addMessage(message) {
+    if (!message || message.conversation_id !== activeConversation?.id) return;
+    if (message.id && renderedMessageIds.has(message.id)) return;
+    if (message.id) renderedMessageIds.add(message.id);
+
+    const bubble = document.createElement("div");
+    bubble.className = "message";
+    if (message.sender === currentUsername) {
+      bubble.classList.add("mine");
+    } else {
+      const author = document.createElement("div");
+      author.className = "message-author";
+      author.textContent = message.sender || "Unknown";
+      bubble.appendChild(author);
+    }
+
+    if (message.message_type === "voice" && message.media_url) {
+      const audio = document.createElement("audio");
+      audio.className = "voice-audio";
+      audio.controls = true;
+      audio.preload = "metadata";
+      audio.src = message.media_url;
+      bubble.appendChild(audio);
       const label = document.createElement("div");
-      label.className = "day-label";
-      label.textContent = name;
-      messagesElement.appendChild(label);
-
-      try {
-        const result = await api(`/api/conversations/${conversation.id}/messages`);
-        result.messages.forEach(addMessage);
-        if (socket.connected) socket.emit("join_conversation", { conversation_id: conversation.id });
-      } catch (error) {
-        showNotice(error.message);
-      }
-      messageInput.focus();
+      label.className = "voice-label";
+      label.textContent = `🎙️ Voice message${message.duration ? " · " + Math.round(message.duration) + "s" : ""}`;
+      bubble.appendChild(label);
+    } else {
+      const body = document.createElement("div");
+      body.className = "message-text";
+      body.textContent = message.body || "";
+      bubble.appendChild(body);
     }
 
-    function showNotice(message) {
-      const notice = document.createElement("div");
-      notice.className = "empty-note";
-      notice.textContent = message;
-      messagesElement.appendChild(notice);
+    const meta = document.createElement("div");
+    meta.className = "message-meta";
+    const time = document.createElement("span");
+    time.textContent = message.created_at
+      ? new Date(message.created_at + "Z").toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    meta.appendChild(time);
+    bubble.appendChild(meta);
+    messagesElement.appendChild(bubble);
+    scrollToBottom();
+
+    const conversation = conversations.find(c => c.id === message.conversation_id);
+    if (conversation) {
+      conversation.last_message = {
+        sender: message.sender, body: message.body, created_at: message.created_at
+      };
+      conversations.sort((a, b) =>
+        ((b.last_message || {}).created_at || "").localeCompare((a.last_message || {}).created_at || "")
+      );
+      renderConversationList();
+    }
+  }
+
+  async function loadConversations() {
+    const result = await api("/api/conversations");
+    conversations = result.conversations || [];
+    renderConversationList();
+    if (!activeConversation && conversations.length) await openConversation(conversations[0]);
+  }
+
+  async function openConversation(conversation) {
+    if (activeConversation && socket.connected) {
+      socket.emit("leave_conversation", { conversation_id: activeConversation.id });
     }
 
-    async function createPrivateChat() {
-      const username = prompt("Enter the exact username to chat with:");
-      if (!username || !username.trim()) return;
-      try {
-        const result = await api("/api/conversations/private", {
-          method: "POST",
-          body: JSON.stringify({ username: username.trim() })
-        });
-        await loadConversations();
-        const match = conversations.find(c => c.id === result.conversation.id);
-        if (match) await openConversation(match);
-      } catch (error) {
-        alert(error.message);
-      }
+    activeConversation = conversation;
+    currentlyTyping.clear();
+    typingIndicator.textContent = "";
+    emojiPicker.hidden = true;
+    voiceStatus.textContent = "";
+    renderedMessageIds.clear();
+
+    const name = conversationName(conversation);
+    updateConversationHeader(conversation);
+    statusElement.textContent = "Private conversation";
+
+    messageInput.disabled = false;
+    sendButton.disabled = !socket.connected;
+    emojiButton.disabled = false;
+    voiceButton.disabled = !socket.connected;
+    messageInput.placeholder = "Type a message";
+    renderConversationList();
+    messagesElement.replaceChildren();
+
+    const label = document.createElement("div");
+    label.className = "day-label";
+    label.textContent = name;
+    messagesElement.appendChild(label);
+
+    try {
+      const result = await api(`/api/conversations/${conversation.id}/messages`);
+      result.messages.forEach(addMessage);
+      if (socket.connected) socket.emit("join_conversation", { conversation_id: conversation.id });
+    } catch (error) {
+      showNotice(error.message);
     }
+    messageInput.focus();
+  }
 
-    messageForm.addEventListener("submit", event => {
-      event.preventDefault();
-      const msg = messageInput.value.trim();
-      if (!msg || !activeConversation || !socket.connected) return;
+  function showNotice(message) {
+    const notice = document.createElement("div");
+    notice.className = "empty-note";
+    notice.textContent = message;
+    messagesElement.appendChild(notice);
+  }
 
-      socket.emit("chat_message", { msg, conversation_id: activeConversation.id });
-      messageInput.value = "";
-      socket.emit("typing", {
-        conversation_id: activeConversation.id, is_typing: false
+  async function createPrivateChat() {
+    const username = prompt("Enter the exact username to chat with:");
+    if (!username || !username.trim()) return;
+    try {
+      const result = await api("/api/conversations/private", {
+        method: "POST",
+        body: JSON.stringify({ username: username.trim() })
       });
-      messageInput.focus();
+      await loadConversations();
+      const match = conversations.find(c => c.id === result.conversation.id);
+      if (match) await openConversation(match);
+    } catch (error) {
+      alert(error.message);
+    }
+  }
+
+  messageForm.addEventListener("submit", event => {
+    event.preventDefault();
+    const msg = messageInput.value.trim();
+    if (!msg || !activeConversation || !socket.connected) return;
+
+    socket.emit("chat_message", { msg, conversation_id: activeConversation.id });
+    messageInput.value = "";
+    socket.emit("typing", {
+      conversation_id: activeConversation.id, is_typing: false
     });
+    messageInput.focus();
+  });
 
-    messageInput.addEventListener("input", () => {
-      if (!activeConversation || !socket.connected) return;
-      socket.emit("typing", {
-        conversation_id: activeConversation.id, is_typing: true
+  messageInput.addEventListener("input", () => {
+    if (!activeConversation || !socket.connected) return;
+    socket.emit("typing", {
+      conversation_id: activeConversation.id, is_typing: true
+    });
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => {
+      if (activeConversation && socket.connected) {
+        socket.emit("typing", {
+          conversation_id: activeConversation.id, is_typing: false
+        });
+      }
+    }, 1200);
+  });
+
+  let recorder = null;
+  let recorderStream = null;
+  let audioChunks = [];
+  let recordingStart = 0;
+
+  voiceButton.addEventListener("click", async () => {
+    if (!activeConversation || !socket.connected) return;
+    if (recorder && recorder.state === "recording") {
+      recorder.stop();
+      voiceButton.textContent = "🎙️";
+      voiceStatus.textContent = "Sending voice message…";
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      voiceStatus.textContent = "Voice recording is not supported in this browser.";
+      return;
+    }
+    try {
+      recorderStream = await navigator.mediaDevices.getUserMedia({audio:true});
+      const types = ["audio/webm;codecs=opus","audio/ogg;codecs=opus","audio/mp4"];
+      const mime = types.find(type => MediaRecorder.isTypeSupported(type));
+      recorder = new MediaRecorder(recorderStream, mime ? {mimeType:mime} : undefined);
+      audioChunks = [];
+      recordingStart = Date.now();
+      recorder.addEventListener("dataavailable", event => {
+        if (event.data?.size) audioChunks.push(event.data);
       });
-      clearTimeout(typingTimer);
-      typingTimer = setTimeout(() => {
-        if (activeConversation && socket.connected) {
-          socket.emit("typing", {
-            conversation_id: activeConversation.id, is_typing: false
+      recorder.addEventListener("stop", async () => {
+        const duration = (Date.now() - recordingStart) / 1000;
+        recorderStream?.getTracks().forEach(track => track.stop());
+        recorderStream = null;
+        try {
+          const blob = new Blob(audioChunks, {type: recorder.mimeType || "audio/webm"});
+          if (!blob.size) throw new Error("Recording was empty.");
+          const ext = blob.type.includes("ogg") ? "ogg" : (blob.type.includes("mp4") ? "mp4" : "webm");
+          const form = new FormData();
+          form.append("audio", blob, `voice.${ext}`);
+          const response = await fetch("/api/voice-upload", {method:"POST", body:form});
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(result.error || "Voice upload failed.");
+          socket.emit("voice_message", {
+            conversation_id: activeConversation.id, media_url: result.media_url, duration
           });
+          voiceStatus.textContent = "Voice message sent.";
+        } catch (error) {
+          voiceStatus.textContent = error.message;
+        } finally {
+          audioChunks = [];
+          voiceButton.textContent = "🎙️";
         }
-      }, 1200);
-    });
-
-    let recorder = null;
-    let recorderStream = null;
-    let audioChunks = [];
-    let recordingStart = 0;
-
-    voiceButton.addEventListener("click", async () => {
-      if (!activeConversation || !socket.connected) return;
-      if (recorder && recorder.state === "recording") {
-        recorder.stop();
-        voiceButton.textContent = "🎙️";
-        voiceStatus.textContent = "Sending voice message…";
-        return;
-      }
-      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-        voiceStatus.textContent = "Voice recording is not supported in this browser.";
-        return;
-      }
-      try {
-        recorderStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const types = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
-        const mime = types.find(type => MediaRecorder.isTypeSupported(type));
-        recorder = new MediaRecorder(recorderStream, mime ? { mimeType: mime } : undefined);
-        audioChunks = [];
-        recordingStart = Date.now();
-        recorder.addEventListener("dataavailable", event => {
-          if (event.data?.size) audioChunks.push(event.data);
-        });
-        recorder.addEventListener("stop", async () => {
-          const duration = (Date.now() - recordingStart) / 1000;
-          recorderStream?.getTracks().forEach(track => track.stop());
-          recorderStream = null;
-          try {
-            const blob = new Blob(audioChunks, { type: recorder.mimeType || "audio/webm" });
-            if (!blob.size) throw new Error("Recording was empty.");
-            const ext = blob.type.includes("ogg") ? "ogg" : (blob.type.includes("mp4") ? "mp4" : "webm");
-            const form = new FormData();
-            form.append("audio", blob, `voice.${ext}`);
-            const response = await fetch("/api/voice-upload", { method: "POST", body: form });
-            const result = await response.json().catch(() => ({}));
-            if (!response.ok) throw new Error(result.error || "Voice upload failed.");
-            socket.emit("voice_message", {
-              conversation_id: activeConversation.id, media_url: result.media_url, duration
-            });
-            voiceStatus.textContent = "Voice message sent.";
-          } catch (error) {
-            voiceStatus.textContent = error.message;
-          } finally {
-            audioChunks = [];
-            voiceButton.textContent = "🎙️";
-          }
-        });
-        recorder.start();
-        voiceButton.textContent = "⏹";
-        voiceStatus.textContent = "Recording… tap stop when finished.";
-      } catch (error) {
-        voiceStatus.textContent = error.name === "NotAllowedError"
-          ? "Microphone permission was denied." : `Could not start recording: ${error.message}`;
-      }
-    });
-
-    socket.on("connect", async () => {
-      statusElement.textContent = activeConversation ? "Connected" : "Online";
-      sendButton.disabled = !activeConversation;
-      emojiButton.disabled = !activeConversation;
-      voiceButton.disabled = !activeConversation;
-      socket.emit("get_presence");
-      if (activeConversation) {
-        socket.emit("join_conversation", { conversation_id: activeConversation.id });
-      }
-    });
-
-    socket.on("disconnect", () => {
-      statusElement.textContent = "Reconnecting…";
-      sendButton.disabled = true;
-      voiceButton.disabled = true;
-    });
-
-    socket.on("connect_error", error => {
-      console.error("Socket connection error:", error);
-      statusElement.textContent = "Connection error";
-    });
-
-    socket.on("joined_conversation", data => {
-      if (data.conversation_id === activeConversation?.id) statusElement.textContent = "Connected";
-    });
-
-    // The receiver gets this even when they have not opened this conversation.
-    socket.on("new_message", data => {
-      if (data.conversation_id === activeConversation?.id) {
-        addMessage(data);
-      } else {
-        loadConversations().catch(console.error);
-      }
-    });
-
-    // Sender gets a separate acknowledgement to avoid duplicating the receiver event.
-    socket.on("message_sent", data => {
-      addMessage(data);
-    });
-
-    socket.on("presence_update", data => {
-      const users = data?.online_users || [];
-      onlineUsersElement.replaceChildren();
-      if (!users.length) {
-        const li = document.createElement("li");
-        li.textContent = "No users online";
-        onlineUsersElement.appendChild(li);
-        return;
-      }
-      users.forEach(name => {
-        const li = document.createElement("li");
-        const dot = document.createElement("span");
-        dot.className = "online-dot";
-        li.append(dot, document.createTextNode(name === currentUsername ? `${name} (You)` : name));
-        onlineUsersElement.appendChild(li);
       });
-    });
+      recorder.start();
+      voiceButton.textContent = "⏹";
+      voiceStatus.textContent = "Recording… tap stop when finished.";
+    } catch (error) {
+      voiceStatus.textContent = error.name === "NotAllowedError"
+        ? "Microphone permission was denied." : `Could not start recording: ${error.message}`;
+    }
+  });
 
-    socket.on("user_typing", data => {
-      if (!activeConversation || data.conversation_id !== activeConversation.id ||
+  socket.on("connect", async () => {
+    statusElement.textContent = activeConversation ? "Connected" : "Online";
+    sendButton.disabled = !activeConversation;
+    emojiButton.disabled = !activeConversation;
+    voiceButton.disabled = !activeConversation;
+    socket.emit("get_presence");
+    if (activeConversation) {
+      socket.emit("join_conversation", { conversation_id: activeConversation.id });
+    }
+  });
+
+  socket.on("disconnect", () => {
+    statusElement.textContent = "Reconnecting…";
+    sendButton.disabled = true;
+    voiceButton.disabled = true;
+  });
+
+  socket.on("connect_error", error => {
+    console.error("Socket connection error:", error);
+    statusElement.textContent = "Connection error";
+  });
+
+  socket.on("joined_conversation", data => {
+    if (data.conversation_id === activeConversation?.id) statusElement.textContent = "Connected";
+  });
+
+  // The receiver gets this even when they have not opened this conversation.
+  socket.on("new_message", data => {
+    if (data.conversation_id === activeConversation?.id) {
+      addMessage(data);
+    } else {
+      loadConversations().catch(console.error);
+    }
+  });
+
+  // Sender gets a separate acknowledgement to avoid duplicating the receiver event.
+  socket.on("message_sent", data => {
+    addMessage(data);
+  });
+
+  socket.on("presence_update", data => {
+    const users = data?.online_users || [];
+    onlineUsersElement.replaceChildren();
+    if (!users.length) {
+      const li = document.createElement("li");
+      li.textContent = "No users online";
+      onlineUsersElement.appendChild(li);
+      return;
+    }
+    users.forEach(name => {
+      const li = document.createElement("li");
+      const dot = document.createElement("span");
+      dot.className = "online-dot";
+      li.append(dot, document.createTextNode(name === currentUsername ? `${name} (You)` : name));
+      onlineUsersElement.appendChild(li);
+    });
+  });
+
+  socket.on("user_typing", data => {
+    if (!activeConversation || data.conversation_id !== activeConversation.id ||
         data.username === currentUsername) return;
-      if (data.is_typing) currentlyTyping.add(data.username);
-      else currentlyTyping.delete(data.username);
-      typingIndicator.textContent = currentlyTyping.size
-        ? `${Array.from(currentlyTyping).join(", ")} typing…` : "";
-    });
+    if (data.is_typing) currentlyTyping.add(data.username);
+    else currentlyTyping.delete(data.username);
+    typingIndicator.textContent = currentlyTyping.size
+      ? `${Array.from(currentlyTyping).join(", ")} typing…` : "";
+  });
 
-    socket.on("chat_error", data => showNotice(data?.msg || "A chat error occurred."));
+  socket.on("chat_error", data => showNotice(data?.msg || "A chat error occurred."));
 
-    searchInput.addEventListener("input", renderConversationList);
-    el("newPrivateButton").addEventListener("click", createPrivateChat);
+  el("myProfileButton").addEventListener("click", () => openProfile(null, true));
+  el("conversationTitle").addEventListener("click", () => {
+    const member = activeConversation?.members.find(m => m.username !== currentUsername);
+    if (member) openProfile(member.id, false);
+  });
+  el("conversationAvatar").addEventListener("click", () => {
+    const member = activeConversation?.members.find(m => m.username !== currentUsername);
+    if (member) openProfile(member.id, false);
+  });
+  el("closeProfileModal").addEventListener("click", () => profileModal.hidden = true);
+  profileModal.addEventListener("click", event => { if (event.target === profileModal) profileModal.hidden = true; });
+  el("editProfileButton").addEventListener("click", beginProfileEdit);
+  el("cancelProfileEdit").addEventListener("click", () => { el("profileEdit").hidden = true; el("profileView").hidden = false; });
+  el("profileEdit").addEventListener("submit", saveProfile);
+  document.addEventListener("keydown", event => { if (event.key === "Escape") profileModal.hidden = true; });
 
-    loadConversations().catch(error => {
-      chatList.replaceChildren();
-      const note = document.createElement("div");
-      note.className = "empty-note";
-      note.textContent = error.message;
-      chatList.appendChild(note);
-    });
-}) ();
-  </script>
+  api("/api/profile").then(result => refreshMyProfile(result.profile)).catch(console.error);
+  searchInput.addEventListener("input", renderConversationList);
+  el("newPrivateButton").addEventListener("click", createPrivateChat);
+
+  loadConversations().catch(error => {
+    chatList.replaceChildren();
+    const note = document.createElement("div");
+    note.className = "empty-note";
+    note.textContent = error.message;
+    chatList.appendChild(note);
+  });
+})();
+</script>
 </body>
-
 </html>
