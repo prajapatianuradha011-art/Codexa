@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#07111d"><title>Create account | Codexa Technologies</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
+<body class="auth-body"><main class="auth-shell">
+<section class="auth-showcase"><a class="auth-brand" href="{{ url_for('login') }}"><span class="brand-mark">C<span>.</span></span><span>CODEXA <small>TECHNOLOGIES</small></span></a>
+<div class="showcase-copy"><span class="eyebrow"><i></i> A BETTER WAY TO CONNECT</span><h1>Your next great<br><em>conversation starts here.</em></h1><p>Create your account and bring your conversations, groups and people together.</p></div>
+<div class="showcase-orbit orbit-one"></div><div class="showcase-orbit orbit-two"></div><div class="showcase-glow"></div><div class="showcase-footer"><span>PRIVATE BY DESIGN</span><span>•</span><span>MADE TO CONNECT</span></div></section>
+<section class="auth-main"><div class="auth-card"><div class="mobile-brand"><span class="brand-mark">C<span>.</span></span><span>CODEXA <small>TECHNOLOGIES</small></span></div>
+<div class="auth-heading"><span class="auth-kicker">JOIN CODEXA</span><h2>Create your account</h2><p>It only takes a moment. Set up your account to get started.</p></div>
+<form method="post" action="{{ url_for('signup') }}" class="auth-form"><input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+<label for="username">Username</label><div class="auth-input-wrap"><span class="field-icon">＠</span><input id="username" name="username" maxlength="30" autocomplete="username" placeholder="Choose a username" required></div>
+<label for="password">Password <span class="label-hint">10–128 characters</span></label><div class="auth-input-wrap"><span class="field-icon">⌑</span><input id="password" name="password" type="password" minlength="10" maxlength="128" autocomplete="new-password" placeholder="Create a strong password" required><button class="password-toggle" type="button" data-toggle="password">SHOW</button></div>
+<button class="auth-submit" type="submit"><span>Create account</span><span>→</span></button></form>
+<p class="auth-switch">Already have an account? <a href="{{ url_for('login') }}">Log in <span>↗</span></a></p><div class="auth-secure"><span>◈</span> Your password is securely protected.</div></div><footer class="auth-mobile-footer">CODEXA TECHNOLOGIES · CONNECT WITH CONFIDENCE</footer></section></main>
+<script>document.querySelectorAll('[data-toggle]').forEach(b=>b.addEventListener('click',()=>{const f=document.getElementById(b.dataset.toggle),v=f.type==='password';f.type=v?'text':'password';b.textContent=v?'HIDE':'SHOW';}));</script></body></html>
