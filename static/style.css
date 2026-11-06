@@ -1169,3 +1169,122 @@ input:focus-visible {
     border-radius: 11px;
     margin: 2px 0 4px;
 }
+
+
+/* Best-effort privacy shield: hides the app when the window loses focus or the user enables it. */
+.privacy-toggle.active {
+    background: #087f68;
+    border-color: #087f68;
+}
+
+.privacy-shield[hidden] {
+    display: none !important;
+}
+
+.privacy-shield {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: grid;
+    place-items: center;
+    padding: 22px;
+    background: rgba(5, 15, 19, .98);
+    backdrop-filter: blur(18px);
+    color: #e8f4f1;
+    text-align: center;
+}
+
+.privacy-shield-card {
+    width: min(440px, 100%);
+    padding: 30px 24px;
+    border: 1px solid rgba(255, 255, 255, .13);
+    border-radius: 22px;
+    background: #14262e;
+    box-shadow: 0 20px 70px rgba(0, 0, 0, .4);
+}
+
+.privacy-shield-icon {
+    font-size: 42px;
+    margin-bottom: 10px;
+}
+
+.privacy-shield-card h2 {
+    margin: 0 0 10px;
+    font-size: 21px;
+}
+
+.privacy-shield-card p {
+    color: #b4c7c3;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.privacy-shield-card button {
+    margin: 12px 0 16px;
+    padding: 11px 20px;
+    border: 0;
+    border-radius: 10px;
+    background: #00a884;
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.privacy-shield-card small {
+    display: block;
+    color: #91a7a2;
+    font-size: 10px;
+    line-height: 1.5;
+}
+
+/* Authentication screens */
+.auth-page {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: #0b141a;
+    color: #e9edef
+}
+
+.auth-card {
+    width: min(420px, 100%);
+    display: grid;
+    gap: 12px;
+    padding: 28px;
+    border: 1px solid #26343d;
+    border-radius: 16px;
+    background: #111b21
+}
+
+.auth-card h1,
+.auth-card h2 {
+    margin: 0
+}
+
+.auth-card label {
+    font-size: 14px;
+    color: #aebac1
+}
+
+.auth-card input {
+    padding: 12px;
+    border: 1px solid #34434d;
+    border-radius: 8px;
+    background: #202c33;
+    color: #e9edef
+}
+
+.auth-card button {
+    padding: 12px;
+    border: 0;
+    border-radius: 8px;
+    background: #00a884;
+    color: #062b23;
+    font-weight: 700;
+    cursor: pointer
+}
+
+.auth-card a {
+    color: #53bdeb
+}
