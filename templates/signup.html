@@ -1,1 +1,25 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codexa Sign up</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head><body><main class="auth-page"><form class="auth-card" method="post" action="{{ url_for('signup') }}"><h1>Codexa Technologies</h1><h2>Create account</h2><input type="hidden" name="_csrf_token" value="{{ csrf_token }}"><label>Username</label><input name="username" maxlength="30" autocomplete="username" required><label>Password (10-128 characters)</label><input name="password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required><button type="submit">Create account</button><p>Already registered? <a href="{{ url_for('login') }}">Log in</a></p></form></main></body></html>
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Codexa Sign up</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+    <main class="auth-page">
+        <form class="auth-card" method="post" action="{{ url_for('signup') }}">
+            <h1>Codexa Technologies</h1>
+            <h2>Create account</h2><input type="hidden" name="_csrf_token"
+                value="{{ csrf_token }}"><label>Username</label><input name="username" maxlength="30"
+                autocomplete="username" required><label>Password (Min 8-characters)</label><input name="password"
+                type="password" minlength="10" maxlength="128" autocomplete="new-password" required><button
+                type="submit">Create account</button>
+            <p>Already registered? <a href="{{ url_for('login') }}">Log in</a></p>
+        </form>
+    </main>
+</body>
+
+</html>
