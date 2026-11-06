@@ -1,9 +1,6 @@
 import os
 import sqlite3
 import uuid
-import time
-import secrets
-import threading
 from pathlib import Path
 from collections import defaultdict
 
@@ -12,76 +9,9 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-_secret = os.environ.get("SECRET_KEY")
-if not _secret:
-    _secret = secrets.token_hex(32)
-    app.logger.warning("SECRET_KEY is unset; sessions reset on restart. Set a stable SECRET_KEY in production.")
-app.config.update(
-    SECRET_KEY=_secret,
-    MAX_CONTENT_LENGTH=51 * 1024 * 1024,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
-    PERMANENT_SESSION_LIFETIME=__import__("datetime").timedelta(hours=12),
-)
-socketio = SocketIO(app, cors_allowed_origins=None, max_http_buffer_size=1_000_000)
-
-# Basic per-process abuse throttling. Use a shared limiter/WAF with multiple workers.
-_rate_lock = threading.Lock()
-_rate_events = defaultdict(list)
-RATE_RULES = {"auth": (8, 15 * 60), "uploads": (30, 10 * 60)}
-
-@app.before_request
-def security_request_guard():
-    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        token = session.get("_csrf_token")
-        supplied = request.headers.get("X-CSRFToken") or request.form.get("_csrf_token")
-        if not token or not supplied or not secrets.compare_digest(str(token), str(supplied)):
-            return jsonify({"error": "Security token expired. Refresh the page and try again."}), 403
-    bucket = None
-    if request.method == "POST" and request.endpoint in ("login", "signup"):
-        bucket = "auth"
-    elif request.method == "POST" and request.path in (
-        "/api/voice-upload", "/api/image-upload", "/api/video-upload", "/api/profile/avatar"
-    ):
-        bucket = "uploads"
-    if bucket:
-        limit, window = RATE_RULES[bucket]
-        key = (bucket, request.remote_addr or "unknown")
-        now = time.time()
-        with _rate_lock:
-            recent = [stamp for stamp in _rate_events[key] if now - stamp < window]
-            if len(recent) >= limit:
-                return jsonify({"error": "Too many attempts. Please wait and try again."}), 429
-            recent.append(now)
-            _rate_events[key] = recent
-
-@app.before_request
-def ensure_csrf_token():
-    if "_csrf_token" not in session:
-        session["_csrf_token"] = secrets.token_urlsafe(32)
-
-@app.context_processor
-def inject_security_template_values():
-    return {"csrf_token": session.get("_csrf_token", "")}
-
-@app.after_request
-def add_security_headers(response):
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.socket.io; "
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
-        "media-src 'self' blob:; connect-src 'self' ws: wss:; "
-        "font-src 'self' data:; object-src 'none'; base-uri 'self'; "
-        "frame-ancestors 'none'; form-action 'self'"
-    )
-    if app.config["SESSION_COOKIE_SECURE"]:
-        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-    return response
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-only-change-this-secret")
+app.config["MAX_CONTENT_LENGTH"] = 51 * 1024 * 1024
+socketio = SocketIO(app, cors_allowed_origins=None)
 
 DATABASE = os.path.join(app.root_path, "chat.db")
 MAX_MESSAGE_LENGTH = 2000
@@ -297,8 +227,8 @@ def signup():
         password = request.form.get("password", "")
         if not username or len(username) > 30:
             return "Username must be 1-30 characters.", 400
-        if len(password) < 10 or len(password) > 128:
-            return "Password must be 10-128 characters.", 400
+        if len(password) < 8:
+            return "Password must be at least 8 characters.", 400
         try:
             with get_db() as conn:
                 # Serialize registration attempts to avoid two simultaneous signups
@@ -346,8 +276,6 @@ def login():
             with get_db() as conn:
                 conn.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],))
             session.clear()
-            session.permanent = True
-            session["_csrf_token"] = secrets.token_urlsafe(32)
             session["user_id"] = user["id"]
             session["user"] = user["username"]
             return redirect(url_for("home"))
@@ -404,21 +332,13 @@ def upload_profile_avatar():
     if not photo or not photo.filename:
         return jsonify({"error": "Choose an image first."}), 400
     extension = Path(photo.filename).suffix.lower()
-    if extension not in ALLOWED_AVATAR_EXTENSIONS:
+    if extension not in ALLOWED_AVATAR_EXTENSIONS or not (photo.mimetype or "").startswith("image/"):
         return jsonify({"error": "Use a PNG, JPG, WEBP or GIF image."}), 400
     content = photo.stream.read(MAX_AVATAR_BYTES + 1)
     if not content:
         return jsonify({"error": "The image is empty."}), 400
     if len(content) > MAX_AVATAR_BYTES:
         return jsonify({"error": "Profile photos must be 3 MB or smaller."}), 413
-    avatar_valid = (
-        (extension == ".png" and content.startswith(b"\x89PNG\r\n\x1a\n"))
-        or (extension in (".jpg", ".jpeg") and content.startswith(b"\xff\xd8\xff"))
-        or (extension == ".gif" and content[:6] in (b"GIF87a", b"GIF89a"))
-        or (extension == ".webp" and content[:4] == b"RIFF" and content[8:12] == b"WEBP")
-    )
-    if not avatar_valid:
-        return jsonify({"error": "The uploaded profile photo is not a valid supported image."}), 400
     filename = f"{uuid.uuid4().hex}{extension}"
     with open(os.path.join(AVATAR_FOLDER, filename), "wb") as output:
         output.write(content)
@@ -817,14 +737,6 @@ def upload_voice_message():
         return jsonify({"error": "The voice recording is empty."}), 400
     if len(content) > MAX_VOICE_BYTES:
         return jsonify({"error": "Voice messages must be 8 MB or smaller."}), 413
-    audio_valid = (
-        (extension == ".webm" and content.startswith(bytes.fromhex("1A45DFA3")))
-        or (extension == ".ogg" and content.startswith(b"OggS"))
-        or (extension == ".wav" and len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WAVE")
-        or (extension in (".mp4", ".m4a") and len(content) >= 12 and content[4:8] == b"ftyp")
-    )
-    if not audio_valid:
-        return jsonify({"error": "The uploaded file is not a valid supported audio file."}), 400
     filename = f"{uuid.uuid4().hex}{extension}"
     with open(os.path.join(VOICE_FOLDER, filename), "wb") as output:
         output.write(content)
